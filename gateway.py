@@ -329,7 +329,7 @@ def translate_request(body):
     if effort:
         result["reasoning"] = {"effort": effort}
     tools = [
-        t["function"] for t in body.get("tools") or []
+        {"type": "function", **t["function"]} for t in body.get("tools") or []
         if isinstance(t, dict) and t.get("type") == "function" and isinstance(t.get("function"), dict)
     ]
     if tools:
@@ -650,6 +650,11 @@ class Context:
                 "Content-Type": "application/json",
                 "Accept": "text/event-stream",
                 "Authorization": "Bearer " + account.access_token,
+                "User-Agent": "grok-shell/1.0.44 (linux; x86_64)",
+                "x-grok-client-identifier": "grok-shell",
+                "x-grok-client-version": "1.0.44",
+                "x-xai-token-auth": "xai-grok-cli",
+                "x-grok-client-mode": "headless",
             },
             method="POST",
         )

@@ -39,6 +39,7 @@ Persistent state contains only account id, last-used timestamp, exhausted-until 
 
 - Client authentication uses `Authorization: Bearer <GATEWAY_API_KEY>` and `hmac.compare_digest`. Missing or wrong credentials receive the same generic HTTP 401 JSON error.
 - Upstream authentication is exactly `Authorization: Bearer <accessToken>`; tokens never appear in URLs.
+- Grok CLI requires `User-Agent: grok-shell/1.0.44 (linux; x86_64)`, `x-grok-client-identifier: grok-shell`, `x-grok-client-version: 1.0.44`, `x-xai-token-auth: xai-grok-cli`, and `x-grok-client-mode: headless`; requests without these were rejected with HTTP 426 during the live smoke test.
 - Only the configured HTTPS upstream origin is allowed. The implementation uses `ssl.create_default_context()` with hostname checking and `CERT_REQUIRED`; there is no option to disable verification.
 - Logs may contain request id, attempt number, model, upstream status, lock expiry, and elapsed time. Logs must not contain account ids, emails, access tokens, refresh tokens, API keys, request bodies, response bodies, or authorization headers.
 - Tests explicitly assert that sentinel credentials are absent from logs and state.
@@ -50,7 +51,7 @@ Persistent state contains only account id, last-used timestamp, exhausted-until 
 - Assistant text becomes `output_text` content.
 - Assistant `tool_calls` become separate `function_call` items using the original `call_id`, name, and arguments.
 - Tool results become `function_call_output` items with matching `call_id`.
-- [OI] function tools are flattened to Responses function tools.
+- [OI] function tools are flattened to Responses function tools while preserving top-level `type: "function"`; omitting that field produced upstream HTTP 422 in the live smoke test.
 - `max_tokens` becomes `max_output_tokens`; this must not be dropped.
 - Model suffixes `-high` and `-xhigh` select reasoning effort and are removed from the upstream model name.
 - Unsupported [OI] sampling fields are not invented or silently translated; only known safe fields are forwarded.

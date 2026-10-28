@@ -53,6 +53,11 @@ class FakeUpstream:
                 payload = json.loads(self.rfile.read(length))
                 outer.calls.append({
                     "authorization": self.headers.get("Authorization"),
+                    "user_agent": self.headers.get("User-Agent"),
+                    "client_version": self.headers.get("x-grok-client-version"),
+                    "client_identifier": self.headers.get("x-grok-client-identifier"),
+                    "token_auth": self.headers.get("x-xai-token-auth"),
+                    "client_mode": self.headers.get("x-grok-client-mode"),
                     "payload": payload,
                 })
                 status, body = outer.handler(len(outer.calls), payload)
@@ -241,6 +246,7 @@ def test_request_translation_preserves_tools_history_and_token_cap():
         "type": "function_call_output", "call_id": "call-1", "output": "contents",
     }
     assert result["tools"][0]["name"] == "read"
+    assert result["tools"][0]["type"] == "function"
     assert "function" not in result["tools"][0]
 
 
@@ -382,6 +388,11 @@ def test_exhaustion_locks_first_account_and_retries_next(store):
         assert upstream.calls[0]["authorization"] == "Bearer token-a"
         assert upstream.calls[1]["authorization"] == "Bearer token-b"
         assert upstream.calls[1]["payload"]["max_output_tokens"] == 40
+        assert upstream.calls[1]["user_agent"] == "grok-shell/1.0.44 (linux; x86_64)"
+        assert upstream.calls[1]["client_version"] == "1.0.44"
+        assert upstream.calls[1]["client_identifier"] == "grok-shell"
+        assert upstream.calls[1]["token_auth"] == "xai-grok-cli"
+        assert upstream.calls[1]["client_mode"] == "headless"
 
         status2, _ = gateway.post(chat())
         assert status2 == 200
