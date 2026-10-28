@@ -15,6 +15,12 @@ The gateway calls `https://cli-chat-proxy.grok.com/v1/responses` directly. It is
 - Credentials are read-only and never written to logs or gateway state.
 - One gateway process per state file.
 
+## Clone
+
+```sh
+git clone https://github.com/Lyravein/grok-gateway.git /home/lyravein/workspace/grok-gateway
+```
+
 ## Configure
 
 Create `/home/lyravein/.config/grok-gateway/env` with mode `0600`:
@@ -39,7 +45,7 @@ GROK_TIMEOUT=300
 mkdir -p /home/lyravein/.local/state/grok-gateway
 chmod 700 /home/lyravein/.local/state/grok-gateway
 set -a; . /home/lyravein/.config/grok-gateway/env; set +a
-/usr/bin/python3 /home/lyravein/Documents/Playground/project/grok-gateway/gateway.py
+/usr/bin/python3 /home/lyravein/workspace/grok-gateway/gateway.py
 ```
 
 The default listener is `127.0.0.1:8787`. Do not expose it directly to the public internet.
@@ -77,7 +83,7 @@ systemctl --user enable --now grok-gateway.service
 systemctl --user status grok-gateway.service
 ```
 
-The unit expects the project at `/home/lyravein/Documents/Playground/project/grok-gateway` and the environment file shown above. Edit the unit first if the project lives elsewhere.
+The unit expects a clone at `/home/lyravein/workspace/grok-gateway` and the environment file shown above. Edit the unit first if the clone lives elsewhere.
 
 ## Tests
 
