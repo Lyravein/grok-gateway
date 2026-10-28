@@ -150,7 +150,14 @@ class AccountStore:
         return self._state["accounts"].setdefault(account_id, {})
 
     def check_permissions(self):
-        """Refuse to run with a state file other local users can touch."""
+        """Refuse to run with state or its directory accessible to others."""
+        directory = os.path.dirname(os.path.abspath(self.state_path))
+        try:
+            directory_mode = os.stat(directory).st_mode
+        except FileNotFoundError:
+            directory_mode = 0o700
+        if directory_mode & 0o077:
+            raise RuntimeError("state directory is group/world accessible")
         try:
             mode = os.stat(self.state_path).st_mode
         except FileNotFoundError:
@@ -230,7 +237,9 @@ class AccountStore:
                             except ValueError:
                                 continue
                         if isinstance(value, (int, float)):
-                            return float(value)
+                            value = float(value)
+                            if 1_000_000_000 <= value < 10_000_000_000:
+                                return value
                 stack.extend(node.values())
             elif isinstance(node, list):
                 stack.extend(node)
@@ -574,6 +583,9 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
             length = int(self.headers.get("Content-Length") or 0)
         except ValueError:
             return _error(self, 400, "bad request", "invalid_request")
+        if length < 0:
+            self.close_connection = True
+            return _error(self, 400, "bad request", "invalid_request")
         if length > self.state.max_body_bytes:
             self.close_connection = True
             return _error(self, 413, "request too large", "request_too_large")
@@ -678,6 +690,7 @@ class Context:
             translator = ResponsesTranslator()
             buffered = []
             started = False
+            output_accepted = False
             ended = False
             try:
                 for raw_line in response:
@@ -697,10 +710,12 @@ class Context:
                     kind = event.get("type")
                     if kind in ("error", "response.failed"):
                         text = json.dumps(event)
-                        if not started and contains_exhaustion(text):
+                        if not started and not output_accepted and contains_exhaustion(text):
                             self.state.store.mark_exhausted(account.id, text)
                             return "retry"
                         raise ProtocolError("upstream error event")
+                    if kind == "response.output_item.added" and (event.get("item") or {}).get("type") == "function_call":
+                        output_accepted = True
                     packets = translator.feed(event)
                     if kind == "response.completed":
                         ended = True
@@ -724,14 +739,16 @@ class Context:
                 return "done"
             except ProtocolError as error:
                 log.warning("request %s: protocol error: %s", self.request_id, error)
-                if started:
-                    if not self.stream:
+                if started or output_accepted:
+                    if not self._stream_started:
                         _error(self.handler, 502, "upstream protocol error", "upstream_error")
-                    return "protocol"  # never send a successful finish or [DONE]
+                    return "protocol"  # never retry or send a successful finish
                 return self._pre_output_failure(account, attempt)
             except (OSError, http.client.HTTPException):
                 log.warning("request %s: upstream stream aborted", self.request_id)
-                if started:
+                if started or output_accepted:
+                    if not self._stream_started:
+                        _error(self.handler, 502, "upstream stream aborted", "upstream_error")
                     return "fatal"
                 self.state.store.cooldown(account.id)
                 return "retry"
@@ -757,7 +774,10 @@ class Context:
 
     def _pre_output_failure(self, account, attempt):
         self.state.store.cooldown(account.id)
-        return "retry" if attempt < self.state.max_attempts else "fatal"
+        if attempt < self.state.max_attempts:
+            return "retry"
+        _error(self.handler, 502, "upstream protocol error", "upstream_error")
+        return "fatal"
 
     # -- client output ----------------------------------------------------
 

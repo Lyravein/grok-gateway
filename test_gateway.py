@@ -11,6 +11,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import pytest
 
 from gateway import (
+    LOCK_SECONDS,
     Account,
     AccountStore,
     NoAccountAvailable,
@@ -174,6 +175,18 @@ def test_rotation_uses_least_recently_used(store):
     assert store.select().id == "b"
     store.release("b")
     assert store.select().id == "c"
+
+
+def test_state_directory_must_be_private(store, tmp_path):
+    os.chmod(tmp_path, 0o777)
+    with pytest.raises(RuntimeError):
+        store.check_permissions()
+    os.chmod(tmp_path, 0o700)
+
+
+def test_millisecond_reset_timestamp_falls_back_to_24_hours(store):
+    lock_until = store.mark_exhausted("a", body=json.dumps({"reset_at": 1793159000000}))
+    assert lock_until == 1000.0 + LOCK_SECONDS
 
 
 def test_corrupt_state_is_preserved_without_reading_contents(tmp_path):
@@ -417,6 +430,60 @@ def test_no_retry_after_stream_output_starts(store):
         assert status == 200
         assert "partial" in raw
         assert "[DONE]" not in raw
+        assert len(upstream.calls) == 1
+    finally:
+        gateway.close()
+        upstream.close()
+
+
+def test_terminal_protocol_failure_returns_http_error(store):
+    upstream = FakeUpstream(lambda count, payload: (200, "data: {broken}\n\n"))
+    gateway = RunningGateway(store, upstream.url, max_attempts=1)
+    try:
+        status, raw = gateway.post(chat())
+        assert status == 502
+        assert json.loads(raw)["error"]["type"] == "upstream_error"
+        assert len(upstream.calls) == 1
+    finally:
+        gateway.close()
+        upstream.close()
+
+
+def test_negative_content_length_is_rejected(store):
+    upstream = FakeUpstream(lambda count, payload: (200, "".join(text_events())))
+    gateway = RunningGateway(store, upstream.url)
+    try:
+        conn = http.client.HTTPConnection("127.0.0.1", gateway.port, timeout=5)
+        conn.putrequest("POST", "/v1/chat/completions")
+        conn.putheader("Authorization", "Bearer gateway-secret")
+        conn.putheader("Content-Type", "application/json")
+        conn.putheader("Content-Length", "-1")
+        conn.endheaders()
+        response = conn.getresponse()
+        assert response.status == 400
+        response.read()
+        conn.close()
+        assert upstream.calls == []
+    finally:
+        gateway.close()
+        upstream.close()
+
+
+def test_tool_item_start_disables_retry(store):
+    body = (
+        sse({"type": "response.output_item.added", "output_index": 0, "item": {
+            "type": "function_call", "id": "fc1", "call_id": "call1", "name": "read_file",
+        }})
+        + sse({"type": "response.failed", "response": {"error": {
+            "code": "subscription:free-usage-exhausted",
+        }}})
+    )
+    upstream = FakeUpstream(lambda count, payload: (200, body))
+    gateway = RunningGateway(store, upstream.url)
+    try:
+        status, raw = gateway.post(chat(stream=True))
+        assert status == 502
+        assert json.loads(raw)["error"]["type"] == "upstream_error"
         assert len(upstream.calls) == 1
     finally:
         gateway.close()
