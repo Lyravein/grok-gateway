@@ -182,25 +182,32 @@ def test_corrupt_state_is_preserved_without_reading_contents(tmp_path):
 
 
 def test_inflight_accounts_are_never_shared(store):
-    barrier = threading.Barrier(3)
+    all_selected = threading.Event()
+    release_all = threading.Event()
+    append_lock = threading.Lock()
     selected = []
 
     def choose():
         chosen = store.select()
-        selected.append(chosen.id)
-        barrier.wait(timeout=2)
+        with append_lock:
+            selected.append(chosen.id)
+            if len(selected) == 3:
+                all_selected.set()
+        assert release_all.wait(timeout=2)
         store.release(chosen.id)
 
     threads = [threading.Thread(target=choose) for _ in range(3)]
     for thread in threads:
         thread.start()
-    barrier.wait(timeout=2)
+    assert all_selected.wait(timeout=2)
     assert sorted(selected) == ["a", "b", "c"]
     with pytest.raises(NoAccountAvailable) as error:
         store.select()
     assert error.value.kind == "busy"
+    release_all.set()
     for thread in threads:
         thread.join(timeout=2)
+    assert all(not thread.is_alive() for thread in threads)
 
 
 def test_request_translation_preserves_tools_history_and_token_cap():
@@ -291,6 +298,57 @@ def test_tls_verification_cannot_be_disabled():
     context = make_tls_context()
     assert context.verify_mode == ssl.CERT_REQUIRED
     assert context.check_hostname is True
+
+
+def test_stream_chunks_have_openai_shape_and_usage(store):
+    upstream = FakeUpstream(lambda count, payload: (200, "".join(text_events("ok"))))
+    gateway = RunningGateway(store, upstream.url)
+    try:
+        status, raw = gateway.post(chat(stream=True))
+        assert status == 200
+        lines = [line[6:] for line in raw.splitlines() if line.startswith("data: ")]
+        assert lines[-1] == "[DONE]"
+        chunks = [json.loads(line) for line in lines[:-1]]
+        first = chunks[0]
+        assert first["choices"][0]["index"] == 0
+        assert first["choices"][0]["delta"] == {"content": "ok"}
+        final = chunks[-1]
+        assert final["choices"][0]["index"] == 0
+        assert final["choices"][0]["finish_reason"] == "stop"
+        assert final["usage"] == {
+            "prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12,
+        }
+    finally:
+        gateway.close()
+        upstream.close()
+
+
+def test_stream_empty_response_still_returns_valid_headers(store):
+    events = [sse({"type": "response.completed", "response": {}}), "data: [DONE]\n\n"]
+    upstream = FakeUpstream(lambda count, payload: (200, "".join(events)))
+    gateway = RunningGateway(store, upstream.url)
+    try:
+        status, raw = gateway.post(chat(stream=True))
+        assert status == 200
+        assert "chat.completion.chunk" in raw
+        assert "[DONE]" in raw
+    finally:
+        gateway.close()
+        upstream.close()
+
+
+def test_nonstream_usage_uses_openai_token_names(store):
+    upstream = FakeUpstream(lambda count, payload: (200, "".join(text_events("ok"))))
+    gateway = RunningGateway(store, upstream.url)
+    try:
+        status, raw = gateway.post(chat())
+        assert status == 200
+        assert json.loads(raw)["usage"] == {
+            "prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12,
+        }
+    finally:
+        gateway.close()
+        upstream.close()
 
 
 def test_unauthorized_request_never_reaches_upstream(store):
