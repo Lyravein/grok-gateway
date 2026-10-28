@@ -9,6 +9,7 @@ Provide an [OI]-compatible HTTP gateway for Grok CLI OAuth accounts. The gateway
 - Grok upstream: `https://cli-chat-proxy.grok.com/v1/responses`.
 - Account credentials currently live in 9Router's SQLite DB, table `providerConnections`, rows with `provider="grok-cli"` and `isActive=1`.
 - The gateway reads credentials from that DB with SQLite URI `mode=ro`; it never writes to 9Router's DB and never copies tokens into the repository, state file, or logs.
+- Credential extraction is exactly `SELECT id, data FROM providerConnections WHERE provider='grok-cli' AND isActive=1`, then `json.loads(data)["accessToken"]`. Only a non-empty string is accepted. Rows with malformed JSON or a missing/empty/non-string token are skipped and counted as unusable without logging the row id, email, or raw data.
 - 9Router remains responsible for refreshing OAuth tokens. The gateway re-reads account data at most once every 30 seconds so refreshed access tokens are picked up.
 - Quota lock is account-wide, not per model, because the same upstream account counter was observed across Grok models.
 - Default lock after `subscription:free-usage-exhausted` is 24 hours. If an upstream response supplies a valid future reset timestamp, use that instead.
@@ -26,8 +27,9 @@ Persistent state contains only account id, last-used timestamp, exhausted-until 
 ## Concurrency and state model
 
 - Exactly one gateway process may own a state file. Multiple processes sharing one state file are unsupported and rejected by the deployment documentation.
-- A single `threading.RLock` protects eligibility filtering, least-recently-used selection, last-used updates, exhaustion locks, cooldowns, and every state-file write.
-- Selection and its last-used update happen in the same critical section, before the upstream request. Concurrent requests therefore cannot select the same account solely because both observed stale last-used state.
+- A single `threading.RLock` protects eligibility filtering, in-flight reservations, least-recently-used selection, last-used updates, exhaustion locks, cooldowns, and every state-file write.
+- Selection, insertion into an in-flight account-id set, and its last-used update happen in the same critical section, before the upstream request. An in-flight account is ineligible for every other request and is removed from that set in a `finally` block. Concurrent requests therefore never share one account.
+- If no account is eligible because all otherwise eligible accounts are in flight, return HTTP 503 with `Retry-After: 1`; this is distinct from the all-exhausted HTTP 429 case.
 - State mutations are serialized under the same lock. A lost update must not clear another request's exhaustion lock.
 - State is written to a same-directory temporary file opened with mode `0600`, flushed and `fsync`ed, then installed with `os.replace`. The state directory is created with mode `0700`.
 - Missing state means empty state. Corrupt state is preserved by renaming it to `state.json.corrupt-<unix timestamp>`, a generic error is logged without file contents, and the gateway starts with empty state. State must never contain access tokens, refresh tokens, email addresses, request text, or response text.
@@ -60,7 +62,7 @@ Persistent state contains only account id, last-used timestamp, exhausted-until 
 - `response.output_text.done` supplies text only when no text delta for that output item was accepted, preventing duplicated text.
 - `response.output_item.added` with `item.type="function_call"` allocates the next chat tool index and records it by upstream `output_index` and `item.id`. It emits one initial chat tool call containing `index`, `id=item.call_id or item.id`, `type="function"`, `function.name`, and empty arguments. If neither id nor name exists, this is a protocol error; no placeholder identity is invented.
 - `response.function_call_arguments.delta` resolves its call by `output_index`, falling back to `item_id`. It appends the argument delta to that exact call. An unknown reference is a protocol error, not a silently dropped argument.
-- `response.output_item.done` for a function call uses full `item.arguments` only when no argument deltas were accepted. It then validates that the complete arguments are JSON and marks that call complete. Interleaved calls retain independent indexes and argument buffers.
+- `response.output_item.done` for a function call resolves the existing call by event `output_index` first and `item.id` second. If both are present they must reference the same call; disagreement is a protocol error. It uses full `item.arguments` only when no argument deltas were accepted, validates that the complete arguments are JSON, and marks that call complete. Interleaved calls retain independent indexes and argument buffers.
 - `response.completed` yields finish reason `tool_calls` if at least one complete function call exists, otherwise `stop`. If any started call remains incomplete, or if any referenced event is malformed, the response is a protocol failure rather than a fabricated successful finish.
 - Usage from `response.completed` is copied when available. Successful streams end with `data: [DONE]`.
 - On malformed SSE, invalid JSON event data, unknown tool-call references, or incomplete tool calls after output has started, the gateway logs a generic protocol error and aborts the stream without a successful finish or `[DONE]`. It never replays the request.
