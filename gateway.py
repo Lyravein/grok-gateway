@@ -533,11 +533,22 @@ def _error(handler, status, message, code="error", headers=None):
     _json_response(handler, status, {"error": {"message": message, "type": code}}, headers)
 
 
-def _chunk(choices=None, **extra):
+def _chunk(choices=None, model="grok", **extra):
     payload = {"id": "chatcmpl-gateway", "object": "chat.completion.chunk",
-               "created": int(time.time()), "model": "grok", "choices": choices or []}
+               "created": int(time.time()), "model": model, "choices": choices or []}
     payload.update(extra)
     return payload
+
+
+def openai_usage(usage):
+    """Map Responses token names onto [OI] chat completion names."""
+    if not isinstance(usage, dict):
+        return None
+    return {
+        "prompt_tokens": usage.get("input_tokens", usage.get("prompt_tokens", 0)),
+        "completion_tokens": usage.get("output_tokens", usage.get("completion_tokens", 0)),
+        "total_tokens": usage.get("total_tokens", 0),
+    }
 
 
 class GatewayRequestHandler(BaseHTTPRequestHandler):
@@ -584,6 +595,7 @@ class Context:
         self.request_id = os.urandom(6).hex()
         self.tried = set()
         self.stream = bool(body.get("stream"))
+        self._stream_started = False
         self.model = body.get("model") or "grok"
 
     # -- entry ------------------------------------------------------------
@@ -745,8 +757,9 @@ class Context:
     # -- client output ----------------------------------------------------
 
     def _start_stream(self, packets):
-        if not self.stream:
+        if not self.stream or self._stream_started:
             return
+        self._stream_started = True
         self.handler.send_response(200)
         self.handler.send_header("Content-Type", "text/event-stream")
         self.handler.send_header("Cache-Control", "no-cache")
@@ -754,22 +767,25 @@ class Context:
         self.handler.end_headers()
         self.handler.close_connection = True
         for packet in packets:
-            self._write_chunk(packet)
+            self._write_chunk(packet["delta"])
 
     def _emit(self, packet):
         if self.stream:
-            self._write_chunk(packet)
+            self._write_chunk(packet["delta"])
 
-    def _write_chunk(self, packet):
-        self.handler.wfile.write(b"data: " + json.dumps(_chunk([packet])).encode() + b"\n\n")
+    def _write_chunk(self, delta, finish_reason=None, usage=None):
+        chunk = _chunk([{"index": 0, "delta": delta, "finish_reason": finish_reason}],
+                       model=self.model)
+        if usage:
+            chunk["usage"] = usage
+        self.handler.wfile.write(b"data: " + json.dumps(chunk).encode() + b"\n\n")
         self.handler.wfile.flush()
 
     def _deliver(self, translator, finish_reason, usage):
         if self.stream:
-            if usage:
-                self._write_chunk({"finish_reason": finish_reason, "usage": usage})
-            else:
-                self._write_chunk({"finish_reason": finish_reason})
+            self._start_stream([])
+            self._write_chunk({}, finish_reason,
+                              openai_usage(usage) if usage else None)
             self.handler.wfile.write(b"data: [DONE]\n\n")
             self.handler.wfile.flush()
             return
@@ -786,7 +802,7 @@ class Context:
             "choices": [{"index": 0, "message": message, "finish_reason": finish_reason}],
         }
         if usage:
-            payload["usage"] = usage
+            payload["usage"] = openai_usage(usage)
         _json_response(self.handler, 200, payload)
 
 
