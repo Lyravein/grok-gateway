@@ -341,10 +341,16 @@ def translate_request(body):
         {"type": "function", **t["function"]} for t in body.get("tools") or []
         if isinstance(t, dict) and t.get("type") == "function" and isinstance(t.get("function"), dict)
     ]
+    if not tools and isinstance(body.get("functions"), list):
+        for f in body["functions"]:
+            if isinstance(f, dict) and "name" in f:
+                tools.append({"type": "function", **f})
     if tools:
         result["tools"] = tools
     if "tool_choice" in body:
         result["tool_choice"] = body["tool_choice"]
+    if "parallel_tool_calls" in body:
+        result["parallel_tool_calls"] = bool(body["parallel_tool_calls"])
     return result
 
 
@@ -434,6 +440,17 @@ class ResponsesTranslator:
     def _on_response_reasoning_summary_text_done(self, event):
         return self._on_response_reasoning_text_done(event)
 
+    def _open_call_packets(self, call):
+        if call.get("opened"):
+            return []
+        call["opened"] = True
+        return [{"delta": {"tool_calls": [{
+            "index": call["index"],
+            "id": call["id"],
+            "type": "function",
+            "function": {"name": call["name"], "arguments": ""},
+        }]}}]
+
     def _on_response_output_item_added(self, event):
         item = event.get("item") or {}
         if item.get("type") != "function_call":
@@ -453,8 +470,10 @@ class ResponsesTranslator:
             raise ProtocolError("unknown tool call reference")
         call["arguments"] += delta
         call["has_delta"] = True
-        return [{"delta": {"tool_calls": [
-            {"index": call["index"], "function": {"arguments": delta}}]}}]
+        packets = self._open_call_packets(call)
+        packets.append({"delta": {"tool_calls": [
+            {"index": call["index"], "function": {"arguments": delta}}]}})
+        return packets
 
     def _on_response_output_item_done(self, event):
         item = event.get("item") or {}
@@ -480,11 +499,12 @@ class ResponsesTranslator:
         except ValueError:
             raise ProtocolError("tool arguments are not valid JSON")
         self._complete.add(call["index"])
+        packets = self._open_call_packets(call)
         if not call["has_delta"]:
             call["has_delta"] = True
-            return [{"delta": {"tool_calls": [
-                {"index": call["index"], "function": {"arguments": call["arguments"]}}]}}]
-        return []
+            packets.append({"delta": {"tool_calls": [
+                {"index": call["index"], "function": {"arguments": call["arguments"]}}]}})
+        return packets
 
     def _on_response_completed(self, event):
         response = event.get("response") or {}
@@ -756,7 +776,7 @@ class Context:
                         buffered.extend(packets)
                         if packets:
                             started = True
-                            self._start_stream(translator.opening_tool_packets())
+                            self._start_stream([])
                             for packet in buffered:
                                 self._emit(packet)
                             buffered = []

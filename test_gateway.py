@@ -21,6 +21,7 @@ from gateway import (
     make_server,
     make_tls_context,
     openai_usage,
+    translate_messages,
     translate_request,
 )
 
@@ -579,5 +580,89 @@ def test_no_retry_after_reasoning_starts(store):
     finally:
         gateway.close()
         upstream.close()
+
+
+def test_streaming_reasoning_followed_by_tool_call_emits_opening_packet(store):
+    events = [
+        sse({"type": "response.reasoning_text.delta", "delta": "I need to call get_weather."}),
+        sse({"type": "response.output_item.added", "output_index": 1, "item": {
+            "type": "function_call", "id": "fc1", "call_id": "call1", "name": "get_weather",
+        }}),
+        sse({"type": "response.function_call_arguments.delta", "output_index": 1, "delta": "{\"loc\": \"PA\"}"}),
+        sse({"type": "response.output_item.done", "output_index": 1, "item": {"id": "fc1"}}),
+        sse({"type": "response.completed", "response": {}}),
+        "data: [DONE]\n\n",
+    ]
+    upstream = FakeUpstream(lambda count, payload: (200, "".join(events)))
+    gateway = RunningGateway(store, upstream.url)
+    try:
+        status, raw = gateway.post(chat(stream=True))
+        assert status == 200
+        lines = [line[6:] for line in raw.splitlines() if line.startswith("data: ")]
+        assert lines[-1] == "[DONE]"
+        chunks = [json.loads(line) for line in lines[:-1]]
+
+        # Chunk 0 has reasoning
+        assert chunks[0]["choices"][0]["delta"] == {"reasoning_content": "I need to call get_weather."}
+
+        # Chunk 1 MUST have tool call definition (index, id, type, name)
+        tool_call_chunk = chunks[1]["choices"][0]["delta"]["tool_calls"][0]
+        assert tool_call_chunk["index"] == 0
+        assert tool_call_chunk["id"] == "call1"
+        assert tool_call_chunk["function"]["name"] == "get_weather"
+
+        # Chunk 2 has arguments
+        args_chunk = chunks[2]["choices"][0]["delta"]["tool_calls"][0]
+        assert args_chunk["index"] == 0
+        assert args_chunk["function"]["arguments"] == "{\"loc\": \"PA\"}"
+
+        # Final chunk finish reason
+        assert chunks[-1]["choices"][0]["finish_reason"] == "tool_calls"
+    finally:
+        gateway.close()
+        upstream.close()
+
+
+def test_legacy_functions_and_parallel_tool_calls():
+    body = {
+        "model": "grok-4.7",
+        "messages": [{"role": "user", "content": "hello"}],
+        "functions": [{
+            "name": "lookup",
+            "description": "lookup user",
+            "parameters": {"type": "object", "properties": {"id": {"type": "string"}}},
+        }],
+        "parallel_tool_calls": False,
+    }
+    result = translate_request(body)
+    assert result["parallel_tool_calls"] is False
+    assert result["tools"] == [{
+        "type": "function",
+        "name": "lookup",
+        "description": "lookup user",
+        "parameters": {"type": "object", "properties": {"id": {"type": "string"}}},
+    }]
+
+
+def test_translate_assistant_with_content_and_tool_calls():
+    messages = [
+        {
+            "role": "assistant",
+            "content": "Looking up details...",
+            "tool_calls": [{
+                "id": "c1",
+                "type": "function",
+                "function": {"name": "query", "arguments": "{}"},
+            }],
+        },
+        {"role": "tool", "tool_call_id": "c1", "content": "found"},
+    ]
+    instructions, items = translate_messages(messages)
+    assert len(items) == 3
+    assert items[0] == {"role": "assistant", "content": [{"type": "output_text", "text": "Looking up details..."}]}
+    assert items[1] == {"type": "function_call", "call_id": "c1", "name": "query", "arguments": "{}"}
+    assert items[2] == {"type": "function_call_output", "call_id": "c1", "output": "found"}
+
+
 
 
