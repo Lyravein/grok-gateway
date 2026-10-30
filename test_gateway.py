@@ -693,6 +693,23 @@ def test_translate_request_extracts_reasoning_effort_from_body():
     assert result3["reasoning"] == {"effort": "medium"}
     assert result3["model"] == "grok-4.7"
 
+    # With router/provider prefix
+    body4 = {
+        "model": "ggw/grok-4.7-high",
+        "messages": [{"role": "user", "content": "hi"}],
+    }
+    result4 = translate_request(body4)
+    assert result4["reasoning"] == {"effort": "high"}
+    assert result4["model"] == "grok-4.7"
+
+    # Generic grok name defaults to grok-4.7
+    body5 = {
+        "model": "ggw/grok",
+        "messages": [{"role": "user", "content": "hi"}],
+    }
+    result5 = translate_request(body5)
+    assert result5["model"] == "grok-4.7"
+
 
 def test_translate_messages_handles_assistant_with_reasoning_content():
     messages = [

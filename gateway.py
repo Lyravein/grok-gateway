@@ -321,7 +321,8 @@ def translate_messages(messages):
 
 
 def translate_request(body):
-    model = str(body.get("model") or "grok-4.7")
+    raw_model = str(body.get("model") or "grok-4.7").strip()
+    model = raw_model.split("/")[-1] if "/" in raw_model else raw_model
     effort = None
     if isinstance(body.get("reasoning_effort"), str):
         effort = body["reasoning_effort"].lower()
@@ -333,6 +334,8 @@ def translate_request(body):
             if model.endswith(suffix):
                 model, effort = model[: -len(suffix)], suffix[1:]
                 break
+    if model in ("", "grok"):
+        model = "grok-4.7"
     instructions, items = translate_messages(body.get("messages"))
     result = {"model": model, "input": items, "stream": True}
     if instructions:
