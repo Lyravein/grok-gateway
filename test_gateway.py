@@ -20,6 +20,7 @@ from gateway import (
     load_accounts,
     make_server,
     make_tls_context,
+    openai_usage,
     translate_request,
 )
 
@@ -500,3 +501,83 @@ def test_oversized_body_is_rejected(store):
     finally:
         gateway.close()
         upstream.close()
+
+
+def test_reasoning_deltas_are_translated_to_reasoning_content():
+    translator = ResponsesTranslator()
+    events = [
+        {"type": "response.reasoning_text.delta", "output_index": 0, "delta": "Thinking step 1. "},
+        {"type": "response.reasoning_summary_text.delta", "output_index": 0, "delta": "Step 2."},
+        {"type": "response.output_text.delta", "output_index": 1, "delta": "Final answer."},
+        {"type": "response.completed", "response": {"usage": {
+            "input_tokens": 15, "output_tokens": 10, "total_tokens": 25,
+            "output_tokens_details": {"reasoning_tokens": 8},
+        }}},
+    ]
+    packets = []
+    for event in events:
+        packets.extend(translator.feed(event))
+
+    assert translator.reasoning == "Thinking step 1. Step 2."
+    assert translator.content == "Final answer."
+    assert packets[0] == {"delta": {"reasoning_content": "Thinking step 1. "}}
+    assert packets[1] == {"delta": {"reasoning_content": "Step 2."}}
+    assert packets[2] == {"delta": {"content": "Final answer."}}
+
+    finish_reason, usage = translator.finish()
+    assert finish_reason == "stop"
+    mapped_usage = openai_usage(usage)
+    assert mapped_usage["completion_tokens_details"]["reasoning_tokens"] == 8
+
+
+def test_reasoning_done_without_prior_deltas_emits_text():
+    translator = ResponsesTranslator()
+    packets = translator.feed({
+        "type": "response.reasoning_text.done", "output_index": 0, "text": "Whole thought."
+    })
+    assert packets == [{"delta": {"reasoning_content": "Whole thought."}}]
+    assert translator.reasoning == "Whole thought."
+
+
+def test_stream_reasoning_starts_stream_immediately(store):
+    events = [
+        sse({"type": "response.reasoning_text.delta", "delta": "pondering"}),
+        sse({"type": "response.output_text.delta", "delta": "result"}),
+        sse({"type": "response.completed", "response": {}}),
+        "data: [DONE]\n\n",
+    ]
+    upstream = FakeUpstream(lambda count, payload: (200, "".join(events)))
+    gateway = RunningGateway(store, upstream.url)
+    try:
+        status, raw = gateway.post(chat(stream=True))
+        assert status == 200
+        lines = [line[6:] for line in raw.splitlines() if line.startswith("data: ")]
+        assert lines[-1] == "[DONE]"
+        chunks = [json.loads(line) for line in lines[:-1]]
+        assert chunks[0]["choices"][0]["delta"] == {"reasoning_content": "pondering"}
+        assert chunks[1]["choices"][0]["delta"] == {"content": "result"}
+    finally:
+        gateway.close()
+        upstream.close()
+
+
+def test_no_retry_after_reasoning_starts(store):
+    events = (
+        sse({"type": "response.reasoning_text.delta", "delta": "pondering"})
+        + sse({"type": "response.failed", "response": {"error": {
+            "code": "subscription:free-usage-exhausted",
+        }}})
+    )
+    upstream = FakeUpstream(lambda count, payload: (200, events))
+    gateway = RunningGateway(store, upstream.url)
+    try:
+        status, raw = gateway.post(chat(stream=True))
+        assert status == 200
+        assert "pondering" in raw
+        assert "[DONE]" not in raw
+        assert len(upstream.calls) == 1
+    finally:
+        gateway.close()
+        upstream.close()
+
+

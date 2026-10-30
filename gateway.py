@@ -361,9 +361,11 @@ class ResponsesTranslator:
     def __init__(self):
         self.calls = []
         self.content = ""
+        self.reasoning = ""
         self.usage = None
         self._by_index, self._by_id = {}, {}
         self._delta_text = set()
+        self._delta_reasoning = set()
         self._complete = set()
 
     # -- helpers ----------------------------------------------------------
@@ -409,6 +411,28 @@ class ResponsesTranslator:
             return []
         self.content += text
         return [{"delta": {"content": text}}]
+
+    def _on_response_reasoning_text_delta(self, event):
+        delta = event.get("delta")
+        if not isinstance(delta, str):
+            raise ProtocolError("reasoning delta missing")
+        self._delta_reasoning.add(event.get("output_index", event.get("item_id")))
+        self.reasoning += delta
+        return [{"delta": {"reasoning_content": delta}}]
+
+    def _on_response_reasoning_summary_text_delta(self, event):
+        return self._on_response_reasoning_text_delta(event)
+
+    def _on_response_reasoning_text_done(self, event):
+        index = event.get("output_index", event.get("item_id"))
+        text = event.get("text")
+        if index in self._delta_reasoning or not isinstance(text, str) or not text:
+            return []
+        self.reasoning += text
+        return [{"delta": {"reasoning_content": text}}]
+
+    def _on_response_reasoning_summary_text_done(self, event):
+        return self._on_response_reasoning_text_done(event)
 
     def _on_response_output_item_added(self, event):
         item = event.get("item") or {}
@@ -553,11 +577,16 @@ def openai_usage(usage):
     """Map Responses token names onto [OI] chat completion names."""
     if not isinstance(usage, dict):
         return None
-    return {
+    result = {
         "prompt_tokens": usage.get("input_tokens", usage.get("prompt_tokens", 0)),
         "completion_tokens": usage.get("output_tokens", usage.get("completion_tokens", 0)),
         "total_tokens": usage.get("total_tokens", 0),
     }
+    output_details = usage.get("output_tokens_details") or {}
+    reasoning_tokens = usage.get("reasoning_tokens", output_details.get("reasoning_tokens"))
+    if reasoning_tokens is not None:
+        result["completion_tokens_details"] = {"reasoning_tokens": int(reasoning_tokens)}
+    return result
 
 
 class GatewayRequestHandler(BaseHTTPRequestHandler):
@@ -714,7 +743,8 @@ class Context:
                             self.state.store.mark_exhausted(account.id, text)
                             return "retry"
                         raise ProtocolError("upstream error event")
-                    if kind == "response.output_item.added" and (event.get("item") or {}).get("type") == "function_call":
+                    if (kind in ("response.reasoning_text.delta", "response.reasoning_summary_text.delta", "response.output_text.delta")
+                            or (kind == "response.output_item.added" and (event.get("item") or {}).get("type") == "function_call")):
                         output_accepted = True
                     packets = translator.feed(event)
                     if kind == "response.completed":
@@ -815,6 +845,8 @@ class Context:
             self.handler.wfile.flush()
             return
         message = {"role": "assistant", "content": translator.content or None}
+        if translator.reasoning:
+            message["reasoning_content"] = translator.reasoning
         if translator.calls:
             message["tool_calls"] = [
                 {"id": c["id"], "type": "function",
