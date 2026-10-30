@@ -1,12 +1,12 @@
 [Unit]
-Description=Grok account-rotating [OI] gateway
+Description=Grok account-rotating OpenAI gateway
 After=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=%h/workspace/grok-gateway
+WorkingDirectory=%h/grok-gateway
 EnvironmentFile=%h/.config/grok-gateway/env
-ExecStart=/usr/bin/python3 %h/workspace/grok-gateway/gateway.py
+ExecStart=/usr/bin/python3 %h/grok-gateway/gateway.py
 Restart=always
 RestartSec=3
 NoNewPrivileges=true

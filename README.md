@@ -1,117 +1,147 @@
 # grok-gateway
 
-[OI]-compatible gateway for Grok CLI OAuth accounts. It reads accounts from 9Router's SQLite database, rotates them by least recent use, and locks an account for 24 hours when Grok reports `subscription:free-usage-exhausted`.
+An OpenAI-compatible gateway and backend for Grok CLI OAuth accounts. It automatically reads accounts from 9Router's SQLite database, rotates them using least-recently-used (LRU) scheduling, and locks an account for 24 hours whenever Grok reports `subscription:free-usage-exhausted`.
 
-The gateway calls `https://cli-chat-proxy.grok.com/v1/responses` directly. It is not a reverse proxy in front of 9Router: account selection happens here, where the credentials are available.
+The gateway talks directly to Grok's Responses API (`https://cli-chat-proxy.grok.com/v1/responses`). It acts as a full standalone OpenAI backend for coding agents, web UIs, and client applications.
 
-## Properties
+## Key Features
 
-- Python 3.10+ standard library only.
-- Full OpenAI-compatible backend: `/v1/chat/completions`, `/chat/completions`, `/v1/models`, `/models`, and `/health`.
-- Thinking / reasoning support: streams `choices[0].delta.reasoning_content` and populates `choices[0].message.reasoning_content` in non-streaming responses.
-- Accurate usage metrics: maps reasoning tokens to `usage.completion_tokens_details.reasoning_tokens`.
-- Two-way tool/function calling: translates OpenAI nested tool schemas and legacy `functions` into Grok Responses format, and emits opening tool call chunks reliably even when preceded by reasoning thoughts.
-- CORS preflight (`OPTIONS`) support for browser-based web UIs.
-- Flexible reasoning effort control: via `reasoning_effort` ("low", "medium", "high", "xhigh"), `reasoning.effort` object, or model suffix (`grok-4.7-high`).
-- `max_tokens` and `max_completion_tokens` forwarded as `max_output_tokens`.
-- Known-exhausted accounts are skipped before any upstream request.
-- A request is retried only before any upstream output has been accepted. Once reasoning, text, or tool-call output starts, there is no replay and no duplicated prefix.
-- In-flight accounts are reserved, so concurrent requests never share one account.
-- Credentials are read-only and never written to logs or gateway state.
-- One gateway process per state file.
+- **Zero Third-Party Runtime Dependencies**: Built with Python 3.10+ standard library only.
+- **Thinking & Reasoning Support**: Streams `choices[0].delta.reasoning_content` and populates `choices[0].message.reasoning_content` for non-streaming requests.
+- **Accurate Usage Tracking**: Maps upstream reasoning tokens directly into `usage.completion_tokens_details.reasoning_tokens`.
+- **Robust Tool & Function Calling**: Two-way translation supporting modern OpenAI tool schemas, legacy `functions`, and `parallel_tool_calls`. Emits opening tool call chunks reliably even when preceded by chain-of-thought thinking.
+- **Standard OpenAI Endpoints & Aliases**: Supports `/v1/chat/completions`, `/chat/completions`, `/v1/models`, `/models`, and `/health`.
+- **Web UI & Browser Ready**: Built-in CORS preflight (`OPTIONS`) handling for Open WebUI, Chatbox, Cherry Studio, etc.
+- **Smart Quota Protection**: Auto-rotates accounts, locks exhausted accounts for 24 hours (or upstream reset time), and guarantees no duplicate execution prefix once output starts.
+- **Concurrent In-Flight Isolation**: Actively reserved in-flight accounts ensure parallel requests never clash on the same account.
 
-## Clone
+## Quickstart
+
+### 1. Clone
 
 ```sh
-git clone https://github.com/Lyravein/grok-gateway.git /home/lyravein/workspace/grok-gateway
+git clone https://github.com/Lyravein/grok-gateway.git
+cd grok-gateway
 ```
 
-## Configure
+### 2. Configuration
 
-Create `/home/lyravein/.config/grok-gateway/env` with mode `0600`:
+Create your configuration directory and environment file (`chmod 0600`):
 
 ```sh
-GATEWAY_API_KEY=replace-with-a-long-random-value
-GROK_DB_PATH=/home/lyravein/.9router/db/data.sqlite
-GATEWAY_STATE=/home/lyravein/.local/state/grok-gateway/state.json
+mkdir -p ~/.config/grok-gateway
+cat << 'EOF' > ~/.config/grok-gateway/env
+GATEWAY_API_KEY=your-secure-random-api-key
+GROK_DB_PATH=/path/to/your/.9router/db/data.sqlite
+GATEWAY_STATE=/path/to/your/.local/state/grok-gateway/state.json
 GATEWAY_HOST=127.0.0.1
 GATEWAY_PORT=8787
 GROK_MAX_ATTEMPTS=8
 GROK_TIMEOUT=300
+EOF
+chmod 600 ~/.config/grok-gateway/env
 ```
 
-`GATEWAY_API_KEY` is the key clients use to call the gateway. It is not a Grok token.
+> **Note**: `GATEWAY_API_KEY` is your own secret key used by clients to authenticate with this gateway. It is not an upstream Grok token.
 
-9Router must remain responsible for refreshing the OAuth tokens. The gateway re-reads `providerConnections` every 30 seconds and accepts only rows where `provider="grok-cli"`, `isActive=1`, and `data.accessToken` is a non-empty string.
+### 3. Environment Variables Reference
 
-## Run
+| Variable | Default | Description |
+|---|---|---|
+| `GATEWAY_API_KEY` | *(Required)* | Secret bearer token required to authenticate requests to the gateway |
+| `GROK_DB_PATH` | *(Required)* | Path to 9Router's SQLite database (`~/.9router/db/data.sqlite`) |
+| `GATEWAY_STATE` | `~/.local/state/grok-gateway/state.json` | Path where LRU rotation and account lockout state is persisted |
+| `GATEWAY_HOST` | `127.0.0.1` | Local bind address (keep local: do not expose directly to public internet) |
+| `GATEWAY_PORT` | `8787` | Port for the HTTP server |
+| `GROK_MAX_ATTEMPTS` | `8` | Maximum number of account rotation attempts before failing |
+| `GROK_TIMEOUT` | `300` | Upstream HTTP timeout in seconds |
+
+### 4. Run the Gateway
+
+Ensure the state directory exists with secure permissions (`0700`):
 
 ```sh
-mkdir -p /home/lyravein/.local/state/grok-gateway
-chmod 700 /home/lyravein/.local/state/grok-gateway
-set -a; . /home/lyravein/.config/grok-gateway/env; set +a
-/usr/bin/python3 /home/lyravein/workspace/grok-gateway/gateway.py
+mkdir -p ~/.local/state/grok-gateway
+chmod 700 ~/.local/state/grok-gateway
+
+# Load environment and start
+set -a; . ~/.config/grok-gateway/env; set +a
+python3 gateway.py
 ```
 
 The default listener is `127.0.0.1:8787`. Do not expose it directly to the public internet.
 
-Check it:
+Verify that the gateway is responding:
 
 ```sh
+# Health check (no auth required)
+curl -s http://127.0.0.1:8787/health
+
+# List supported models
+curl -s http://127.0.0.1:8787/v1/models \
+  -H "Authorization: Bearer your-secure-random-api-key"
+
+# Chat completion with reasoning
 curl -s http://127.0.0.1:8787/v1/chat/completions \
-  -H 'Content-Type: application/json' \
-  -H 'Authorization: Bearer replace-with-a-long-random-value' \
-  -d '{"model":"grok-4.7-high","messages":[{"role":"user","content":"reply with ok"}],"max_tokens":32}'
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer your-secure-random-api-key" \
+  -d '{
+    "model": "grok-4.7-high",
+    "messages": [{"role": "user", "content": "Explain gravity in one sentence."}],
+    "max_tokens": 128
+  }'
 ```
 
-## Wire into 9Router
+## Client Integration
 
-Create an [OI]-compatible custom provider in 9Router with:
+### Direct OpenAI Clients (OpenCode, Hermes, Cursor, Chatbox, etc.)
 
-- Base URL: `http://127.0.0.1:8787/v1`
-- API key: the value of `GATEWAY_API_KEY`
-- Models: `grok-4.7`, `grok-4.7-high`, `grok-4.7-xhigh`, and other variants supported by the upstream account
-
-Route the desired combo to that custom provider. Keep the original `grok-cli` connections enabled so 9Router can refresh their tokens. Do not route the same combo to both the original `grok-cli` provider and this gateway unless double quota use is intended.
-
-Changing the live 9Router provider configuration is a separate operation and is not performed by this repository's tests.
-
-## Direct OpenAI Client Setup
-
-You can point any OpenAI-compatible client directly to the gateway:
-
+Configure your client to point to the local gateway:
 - **Base URL**: `http://127.0.0.1:8787/v1` (or `http://127.0.0.1:8787`)
-- **API Key**: the value of `GATEWAY_API_KEY`
-- **Models**: `grok-4.7`, `grok-4.7-high`, `grok-4.7-xhigh`, `grok-4.6`
-- **Thinking / Reasoning Display**: Supported automatically via standard `delta.reasoning_content` (streaming) and `message.reasoning_content` (non-streaming).
-- **Tool Calling**: Fully supported with function execution and multi-turn loops.
+- **API Key**: The value of your `GATEWAY_API_KEY`
+- **Supported Models**: `grok-4.7`, `grok-4.7-high`, `grok-4.7-xhigh`, `grok-4.7-medium`, `grok-4.7-low`, `grok-4.6`, `grok-4.6-high`, `grok-4.5`
+- **Reasoning / Thinking**: Supported out of the box via `choices[0].delta.reasoning_content`.
+- **Reasoning Effort Control**: Can be specified via `reasoning_effort` ("low", "medium", "high", "xhigh"), the `reasoning: {effort: "high"}` object, or by using model name suffixes (e.g. `grok-4.7-high`).
 
-## systemd user service
+### Wire into 9Router
 
-The template is `deploy/grok-gateway.service`. Install it after reviewing the paths:
+You can also use grok-gateway as a custom provider inside 9Router:
+1. Create an OpenAI-compatible custom provider in 9Router:
+   - **Base URL**: `http://127.0.0.1:8787/v1`
+   - **API Key**: The value of `GATEWAY_API_KEY`
+   - **Models**: `grok-4.7`, `grok-4.7-high`, `grok-4.7-xhigh`
+2. Route desired combos to this custom provider.
+3. Keep the original `grok-cli` connections active in 9Router so 9Router can refresh their OAuth tokens automatically in the background.
+
+## Systemd User Service
+
+To run grok-gateway in the background as a systemd user service:
+
+1. Copy the service template:
+   ```sh
+   mkdir -p ~/.config/systemd/user
+   cp deploy/grok-gateway.service ~/.config/systemd/user/
+   ```
+
+2. Edit `~/.config/systemd/user/grok-gateway.service` if your repository is placed in a custom directory. The template defaults to `%h/grok-gateway`.
+
+3. Enable and start the service:
+   ```sh
+   systemctl --user daemon-reload
+   systemctl --user enable --now grok-gateway.service
+   systemctl --user status grok-gateway.service
+   ```
+
+## Development and Testing
+
+Tests run against a temporary SQLite database and local fake upstream servers. No real accounts or internet connections are used:
 
 ```sh
-mkdir -p /home/lyravein/.config/systemd/user
-cp deploy/grok-gateway.service /home/lyravein/.config/systemd/user/grok-gateway.service
-systemctl --user daemon-reload
-systemctl --user enable --now grok-gateway.service
-systemctl --user status grok-gateway.service
+python3 -m pytest -q
 ```
 
-The unit expects a clone at `/home/lyravein/workspace/grok-gateway` and the environment file shown above. Edit the unit first if the clone lives elsewhere.
+## Security & Architecture Notes
 
-## Tests
-
-```sh
-/usr/bin/python3 -m pytest -q
-```
-
-The suite uses temporary SQLite databases and local fake upstream servers. It never reads real credentials or contacts Grok.
-
-## Limitations
-
-- OAuth login and token refresh are intentionally not implemented.
-- Only one gateway process may own a state file.
-- A rolling 24-hour upstream window may reset earlier than the conservative 24-hour lock. If upstream supplies a future numeric reset timestamp, the gateway uses it.
-- The gateway translates text and function calls only. Images, audio, and provider-specific extensions are out of scope.
-- Corrupt gateway state is preserved as `state.json.corrupt-<timestamp>` and replaced with empty state. 9Router's database is never modified.
+- **Credentials Safety**: The gateway reads `providerConnections` from 9Router in read-only mode. Access tokens are never logged, never stored in the state file, and never returned in API responses.
+- **State Directory Permissions**: The gateway requires that `GATEWAY_STATE` and its directory have strict user-only permissions (`0700` / `0600`) and will refuse to start if accessible by others.
+- **Fail-Safe Retries**: Requests are only retried across accounts before any output has been streamed to the client. Once tokens or tool calls start, retries are locked to prevent duplicate prefixes or corrupted outputs.
