@@ -577,12 +577,34 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
+SUPPORTED_MODELS = [
+    "grok-4.7",
+    "grok-4.7-high",
+    "grok-4.7-xhigh",
+    "grok-4.7-medium",
+    "grok-4.7-low",
+    "grok-4.6",
+    "grok-4.6-high",
+    "grok-4.5",
+]
+
+CORS_HEADERS = {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "POST, GET, OPTIONS",
+    "Access-Control-Allow-Headers": "Authorization, Content-Type, Accept, User-Agent, X-Requested-With",
+    "Access-Control-Max-Age": "86400",
+}
+
+
 def _json_response(handler, status, payload, headers=None):
     raw = json.dumps(payload).encode()
     handler.send_response(status)
     handler.send_header("Content-Type", "application/json")
     handler.send_header("Content-Length", str(len(raw)))
-    for key, value in (headers or {}).items():
+    merged = dict(CORS_HEADERS)
+    if headers:
+        merged.update(headers)
+    for key, value in merged.items():
         handler.send_header(key, value)
     handler.end_headers()
     handler.wfile.write(raw)
@@ -628,8 +650,38 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
         expected = "Bearer " + self.state.api_key
         return hmac.compare_digest(header.encode(), expected.encode())
 
+    def do_OPTIONS(self):
+        self.send_response(204)
+        for key, value in CORS_HEADERS.items():
+            self.send_header(key, value)
+        self.end_headers()
+
+    def do_GET(self):
+        path = self.path.split("?")[0].rstrip("/")
+        if path in ("", "/health", "/healthz"):
+            return _json_response(self, 200, {"status": "ok"})
+        if path in ("/models", "/v1/models"):
+            if not self._authorized():
+                self.close_connection = True
+                return _error(self, 401, "unauthorized", "unauthorized")
+            data = [
+                {
+                    "id": m,
+                    "object": "model",
+                    "created": 1700000000,
+                    "owned_by": "xai",
+                    "permission": [],
+                    "root": m,
+                    "parent": None,
+                }
+                for m in SUPPORTED_MODELS
+            ]
+            return _json_response(self, 200, {"object": "list", "data": data})
+        return _error(self, 404, "not found", "not_found")
+
     def do_POST(self):
-        if self.path.split("?")[0].rstrip("/") != "/v1/chat/completions":
+        path = self.path.split("?")[0].rstrip("/")
+        if path not in ("/v1/chat/completions", "/chat/completions"):
             return _error(self, 404, "not found", "not_found")
         if not self._authorized():
             self.close_connection = True
@@ -845,6 +897,8 @@ class Context:
         self.handler.send_header("Content-Type", "text/event-stream")
         self.handler.send_header("Cache-Control", "no-cache")
         self.handler.send_header("Connection", "close")
+        for key, value in CORS_HEADERS.items():
+            self.handler.send_header(key, value)
         self.handler.end_headers()
         self.handler.close_connection = True
         for packet in packets:

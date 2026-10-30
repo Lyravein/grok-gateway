@@ -710,6 +710,94 @@ def test_translate_messages_handles_assistant_with_reasoning_content():
     assert items[2] == {"role": "assistant", "content": [{"type": "output_text", "text": "final reply"}]}
 
 
+def test_models_endpoint_lists_supported_models(store):
+    upstream = FakeUpstream(lambda count, payload: (200, "".join(text_events())))
+    gateway = RunningGateway(store, upstream.url)
+    try:
+        # /v1/models with auth
+        conn = http.client.HTTPConnection("127.0.0.1", gateway.port, timeout=5)
+        conn.request("GET", "/v1/models", headers={"Authorization": "Bearer gateway-secret"})
+        res = conn.getresponse()
+        assert res.status == 200
+        data = json.loads(res.read().decode())
+        assert data["object"] == "list"
+        model_ids = [m["id"] for m in data["data"]]
+        assert "grok-4.7" in model_ids
+        assert "grok-4.7-high" in model_ids
+        conn.close()
+
+        # /models alias with auth
+        conn2 = http.client.HTTPConnection("127.0.0.1", gateway.port, timeout=5)
+        conn2.request("GET", "/models", headers={"Authorization": "Bearer gateway-secret"})
+        res2 = conn2.getresponse()
+        assert res2.status == 200
+        conn2.close()
+
+        # /v1/models without auth
+        conn3 = http.client.HTTPConnection("127.0.0.1", gateway.port, timeout=5)
+        conn3.request("GET", "/v1/models")
+        res3 = conn3.getresponse()
+        assert res3.status == 401
+        conn3.close()
+    finally:
+        gateway.close()
+        upstream.close()
+
+
+def test_cors_options_returns_allowed_headers(store):
+    upstream = FakeUpstream(lambda count, payload: (200, "".join(text_events())))
+    gateway = RunningGateway(store, upstream.url)
+    try:
+        conn = http.client.HTTPConnection("127.0.0.1", gateway.port, timeout=5)
+        conn.request("OPTIONS", "/v1/chat/completions")
+        res = conn.getresponse()
+        assert res.status == 204
+        assert res.getheader("Access-Control-Allow-Origin") == "*"
+        assert "POST" in (res.getheader("Access-Control-Allow-Methods") or "")
+        conn.close()
+    finally:
+        gateway.close()
+        upstream.close()
+
+
+def test_health_check_requires_no_auth(store):
+    upstream = FakeUpstream(lambda count, payload: (200, "".join(text_events())))
+    gateway = RunningGateway(store, upstream.url)
+    try:
+        for path in ("/health", "/healthz", "/"):
+            conn = http.client.HTTPConnection("127.0.0.1", gateway.port, timeout=5)
+            conn.request("GET", path)
+            res = conn.getresponse()
+            assert res.status == 200
+            data = json.loads(res.read().decode())
+            assert data["status"] == "ok"
+            conn.close()
+    finally:
+        gateway.close()
+        upstream.close()
+
+
+def test_chat_completions_route_alias(store):
+    upstream = FakeUpstream(lambda count, payload: (200, "".join(text_events())))
+    gateway = RunningGateway(store, upstream.url)
+    try:
+        conn = http.client.HTTPConnection("127.0.0.1", gateway.port, timeout=5)
+        body = json.dumps(chat())
+        conn.request("POST", "/chat/completions", body=body, headers={
+            "Authorization": "Bearer gateway-secret",
+            "Content-Type": "application/json",
+        })
+        res = conn.getresponse()
+        assert res.status == 200
+        data = json.loads(res.read().decode())
+        assert data["choices"][0]["message"]["content"] == "ok"
+        conn.close()
+    finally:
+        gateway.close()
+        upstream.close()
+
+
+
 
 
 
