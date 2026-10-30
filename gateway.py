@@ -323,10 +323,16 @@ def translate_messages(messages):
 def translate_request(body):
     model = str(body.get("model") or "grok-4.7")
     effort = None
-    for suffix in ("-xhigh", "-high"):
-        if model.endswith(suffix):
-            model, effort = model[: -len(suffix)], suffix[1:]
-            break
+    if isinstance(body.get("reasoning_effort"), str):
+        effort = body["reasoning_effort"].lower()
+    elif isinstance(body.get("reasoning"), dict) and isinstance(body["reasoning"].get("effort"), str):
+        effort = body["reasoning"]["effort"].lower()
+
+    if not effort:
+        for suffix in ("-xhigh", "-high", "-medium", "-low"):
+            if model.endswith(suffix):
+                model, effort = model[: -len(suffix)], suffix[1:]
+                break
     instructions, items = translate_messages(body.get("messages"))
     result = {"model": model, "input": items, "stream": True}
     if instructions:

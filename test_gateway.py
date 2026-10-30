@@ -664,5 +664,52 @@ def test_translate_assistant_with_content_and_tool_calls():
     assert items[2] == {"type": "function_call_output", "call_id": "c1", "output": "found"}
 
 
+def test_translate_request_extracts_reasoning_effort_from_body():
+    # Via reasoning_effort field
+    body1 = {
+        "model": "grok-4.7",
+        "reasoning_effort": "low",
+        "messages": [{"role": "user", "content": "hi"}],
+    }
+    result1 = translate_request(body1)
+    assert result1["reasoning"] == {"effort": "low"}
+    assert result1["model"] == "grok-4.7"
+
+    # Via reasoning object
+    body2 = {
+        "model": "grok-4.7",
+        "reasoning": {"effort": "HIGH"},
+        "messages": [{"role": "user", "content": "hi"}],
+    }
+    result2 = translate_request(body2)
+    assert result2["reasoning"] == {"effort": "high"}
+
+    # Via model suffix (-low, -medium)
+    body3 = {
+        "model": "grok-4.7-medium",
+        "messages": [{"role": "user", "content": "hi"}],
+    }
+    result3 = translate_request(body3)
+    assert result3["reasoning"] == {"effort": "medium"}
+    assert result3["model"] == "grok-4.7"
+
+
+def test_translate_messages_handles_assistant_with_reasoning_content():
+    messages = [
+        {"role": "user", "content": "question"},
+        {"role": "assistant", "reasoning_content": "thinking", "content": "answer"},
+        {"role": "assistant", "content": [
+            {"type": "thinking", "thinking": "scratchpad"},
+            {"type": "text", "text": "final reply"},
+        ]},
+        {"role": "user", "content": "followup"},
+    ]
+    instructions, items = translate_messages(messages)
+    assert len(items) == 4
+    assert items[1] == {"role": "assistant", "content": [{"type": "output_text", "text": "answer"}]}
+    assert items[2] == {"role": "assistant", "content": [{"type": "output_text", "text": "final reply"}]}
+
+
+
 
 
