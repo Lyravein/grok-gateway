@@ -814,6 +814,27 @@ def test_chat_completions_route_alias(store):
         upstream.close()
 
 
+def test_response_incomplete_sets_finish_reason_length(store):
+    events = [
+        sse({"type": "response.output_text.delta", "delta": "cut off"}),
+        sse({"type": "response.incomplete", "response": {"usage": {"total_tokens": 10}}}),
+        "data: [DONE]\n\n",
+    ]
+    upstream = FakeUpstream(lambda count, payload: (200, "".join(events)))
+    gateway = RunningGateway(store, upstream.url)
+    try:
+        status, raw = gateway.post(chat(stream=True))
+        assert status == 200
+        lines = [line[6:] for line in raw.splitlines() if line.startswith("data: ")]
+        assert lines[-1] == "[DONE]"
+        chunks = [json.loads(line) for line in lines[:-1]]
+        assert chunks[-1]["choices"][0]["finish_reason"] == "length"
+    finally:
+        gateway.close()
+        upstream.close()
+
+
+
 
 
 

@@ -378,6 +378,7 @@ class ResponsesTranslator:
         self.content = ""
         self.reasoning = ""
         self.usage = None
+        self.finish_reason = None
         self._by_index, self._by_id = {}, {}
         self._delta_text = set()
         self._delta_reasoning = set()
@@ -515,6 +516,13 @@ class ResponsesTranslator:
                 {"index": call["index"], "function": {"arguments": call["arguments"]}}]}})
         return packets
 
+    def _on_response_incomplete(self, event):
+        response = event.get("response") or {}
+        if isinstance(response.get("usage"), dict):
+            self.usage = response["usage"]
+        self.finish_reason = "length"
+        return []
+
     def _on_response_completed(self, event):
         response = event.get("response") or {}
         if isinstance(response.get("usage"), dict):
@@ -532,7 +540,8 @@ class ResponsesTranslator:
     def finish(self):
         if len(self._complete) != len(self.calls):
             raise ProtocolError("incomplete tool call")
-        return ("tool_calls" if self.calls else "stop"), self.usage
+        reason = self.finish_reason or ("tool_calls" if self.calls else "stop")
+        return reason, self.usage
 
 
 # --------------------------------------------------------------------------
@@ -828,7 +837,7 @@ class Context:
                             or (kind == "response.output_item.added" and (event.get("item") or {}).get("type") == "function_call")):
                         output_accepted = True
                     packets = translator.feed(event)
-                    if kind == "response.completed":
+                    if kind in ("response.completed", "response.incomplete"):
                         ended = True
                     if started:
                         for packet in packets:
