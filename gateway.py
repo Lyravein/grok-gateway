@@ -1092,7 +1092,7 @@ class Context:
             self.state.store.cooldown(account.id)
             return "retry"
         # 400/401/403/404 etc: a request or credential problem, never quota.
-        log.warning("request %s: upstream HTTP %s: %s", self.request_id, status, body)
+        log.warning("request %s: upstream HTTP %s", self.request_id, status)
         _error(self.handler, 502, "upstream rejected request", "upstream_error")
         return "fatal"
 

@@ -1,5 +1,6 @@
 import http.client
 import json
+import logging
 import os
 import sqlite3
 import ssl
@@ -1071,6 +1072,20 @@ def test_translate_request_sampling_and_metadata():
     assert res["user"] == "client-uid"
     assert "metadata" not in res
     assert res["store"] is False
+
+
+def test_upstream_error_body_sentinel_never_logged(store, caplog):
+    sentinel = "SUPER_SENSITIVE_UPSTREAM_BODY_SENTINEL_XYZ"
+    upstream = FakeUpstream(lambda count, payload: (400, '{"error": "%s"}' % sentinel))
+    gateway = RunningGateway(store, upstream.url)
+    try:
+        with caplog.at_level(logging.DEBUG, logger="grok-gateway"):
+            status, raw = gateway.post(chat())
+            assert status == 502
+            assert sentinel not in caplog.text
+    finally:
+        gateway.close()
+        upstream.close()
 
 
 
