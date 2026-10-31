@@ -5,7 +5,6 @@ See plan.md for the specification. Python 3.10+ standard library only.
 
 import argparse
 import collections
-import hashlib
 import hmac
 import http.client
 import json
@@ -280,7 +279,6 @@ class ReasoningCache:
         self._max = max_entries
         self._lock = threading.Lock()
         self._by_call_id = collections.OrderedDict()
-        self._by_text = collections.OrderedDict()
 
     def put(self, call_id, item):
         if not call_id or not isinstance(item, dict):
@@ -305,34 +303,6 @@ class ReasoningCache:
             item = self._by_call_id.get(str(call_id))
             if item:
                 self._by_call_id.move_to_end(str(call_id))
-                return dict(item)
-            return None
-
-    def put_by_text(self, text, item):
-        if not text or not isinstance(item, dict):
-            return
-        key = hashlib.sha256(text.encode("utf-8")).hexdigest()
-        clean_item = {
-            "type": "reasoning",
-            "summary": item.get("summary") or [],
-        }
-        if item.get("id"):
-            clean_item["id"] = item["id"]
-        if item.get("encrypted_content"):
-            clean_item["encrypted_content"] = item["encrypted_content"]
-        with self._lock:
-            self._by_text[key] = clean_item
-            if len(self._by_text) > self._max:
-                self._by_text.popitem(last=False)
-
-    def get_by_text(self, text):
-        if not text:
-            return None
-        key = hashlib.sha256(text.encode("utf-8")).hexdigest()
-        with self._lock:
-            item = self._by_text.get(key)
-            if item:
-                self._by_text.move_to_end(key)
                 return dict(item)
             return None
 
@@ -404,8 +374,6 @@ def translate_messages(messages, reasoning_cache=None):
                     cached_reasoning = reasoning_cache.get(cid)
                     if cached_reasoning:
                         break
-            if cached_reasoning is None and text and reasoning_cache:
-                cached_reasoning = reasoning_cache.get_by_text(text)
 
             if cached_reasoning:
                 items.append(cached_reasoning)
@@ -1075,9 +1043,6 @@ class Context:
             cid = call.get("id")
             if cid:
                 cache.put(cid, reasoning_item)
-        text = str(translator.content).strip()
-        if text:
-            cache.put_by_text(text, reasoning_item)
 
     def _read_body(self, error):
         try:

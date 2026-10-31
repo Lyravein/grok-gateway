@@ -873,11 +873,30 @@ def test_reasoning_cache_lru_and_lookups():
     assert cache.get("call2") is None
     assert cache.get("call3") is not None
 
-    # By text lookup
-    cache.put_by_text("hello assistant", item1)
-    res_text = cache.get_by_text("hello assistant")
-    assert res_text is not None and res_text["encrypted_content"] == "enc1"
-    assert cache.get_by_text("other text") is None
+
+def test_two_conversations_with_same_assistant_text_never_share_reasoning():
+    cache = ReasoningCache()
+    # Cache has reasoning stored ONLY for call-123
+    cache.put("call-123", {"type": "reasoning", "summary": [], "encrypted_content": "secret-123"})
+
+    # Conversation A with assistant reply "OK" and no matching tool call id
+    msg_a = [
+        {"role": "user", "content": "task 1"},
+        {"role": "assistant", "content": "OK"},
+        {"role": "user", "content": "followup 1"},
+    ]
+    _, items_a = translate_messages(msg_a, reasoning_cache=cache)
+    # Asserts no reasoning item was stitched into items_a
+    assert all(it.get("type") != "reasoning" for it in items_a)
+
+    # Conversation B with same assistant reply "OK"
+    msg_b = [
+        {"role": "user", "content": "task 2"},
+        {"role": "assistant", "content": "OK"},
+        {"role": "user", "content": "followup 2"},
+    ]
+    _, items_b = translate_messages(msg_b, reasoning_cache=cache)
+    assert all(it.get("type") != "reasoning" for it in items_b)
 
 
 def test_responses_translator_captures_reasoning_item():
