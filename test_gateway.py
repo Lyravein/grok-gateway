@@ -12,7 +12,6 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import pytest
 
 from gateway import (
-    EFFORT_VARIANTS,
     LOCK_SECONDS,
     Account,
     AccountStore,
@@ -24,7 +23,6 @@ from gateway import (
     make_server,
     make_tls_context,
     openai_usage,
-    resolve_effort_model,
     translate_messages,
     translate_request,
 )
@@ -253,8 +251,8 @@ def test_request_translation_preserves_tools_history_and_token_cap():
         }}],
     }
     result = translate_request(body)
-    assert result["model"] == "grok-4.7-xhigh"
-    assert "reasoning" not in result
+    assert result["model"] == "grok-4.7"
+    assert result["reasoning"] == {"effort": "xhigh"}
     assert result["max_output_tokens"] == 123
     assert result["instructions"] == "be exact"
     assert result["input"][1] == {
@@ -679,26 +677,25 @@ def test_translate_assistant_with_content_and_tool_calls():
     assert items[2] == {"type": "function_call_output", "call_id": "c1", "output": "found"}
 
 
-def test_translate_request_extracts_reasoning_effort_from_body(monkeypatch):
-    # Via reasoning_effort field (variant mode: grok-4.7-low, no reasoning key)
+def test_translate_request_extracts_reasoning_effort_from_body():
+    # Via reasoning_effort field
     body1 = {
         "model": "grok-4.7",
         "reasoning_effort": "low",
         "messages": [{"role": "user", "content": "hi"}],
     }
     result1 = translate_request(body1)
-    assert result1["model"] == "grok-4.7-low"
-    assert "reasoning" not in result1
+    assert result1["reasoning"] == {"effort": "low"}
+    assert result1["model"] == "grok-4.7"
 
-    # Via reasoning object (high -> grok-4.7 base model, no reasoning key)
+    # Via reasoning object
     body2 = {
         "model": "grok-4.7",
         "reasoning": {"effort": "HIGH"},
         "messages": [{"role": "user", "content": "hi"}],
     }
     result2 = translate_request(body2)
-    assert result2["model"] == "grok-4.7"
-    assert "reasoning" not in result2
+    assert result2["reasoning"] == {"effort": "high"}
 
     # Via model suffix (-low, -medium)
     body3 = {
@@ -706,8 +703,8 @@ def test_translate_request_extracts_reasoning_effort_from_body(monkeypatch):
         "messages": [{"role": "user", "content": "hi"}],
     }
     result3 = translate_request(body3)
-    assert result3["model"] == "grok-4.7-medium"
-    assert "reasoning" not in result3
+    assert result3["reasoning"] == {"effort": "medium"}
+    assert result3["model"] == "grok-4.7"
 
     # With router/provider prefix
     body4 = {
@@ -715,8 +712,8 @@ def test_translate_request_extracts_reasoning_effort_from_body(monkeypatch):
         "messages": [{"role": "user", "content": "hi"}],
     }
     result4 = translate_request(body4)
+    assert result4["reasoning"] == {"effort": "high"}
     assert result4["model"] == "grok-4.7"
-    assert "reasoning" not in result4
 
     # Generic grok name defaults to grok-4.7
     body5 = {
@@ -725,7 +722,6 @@ def test_translate_request_extracts_reasoning_effort_from_body(monkeypatch):
     }
     result5 = translate_request(body5)
     assert result5["model"] == "grok-4.7"
-    assert "reasoning" not in result5
 
     # Unsupported efforts are normalized to prevent upstream HTTP 400
     body_none = {
@@ -733,44 +729,14 @@ def test_translate_request_extracts_reasoning_effort_from_body(monkeypatch):
         "reasoning_effort": "none",
         "messages": [{"role": "user", "content": "hi"}],
     }
-    res_none = translate_request(body_none)
-    assert res_none["model"] == "grok-4.7-low"
-    assert "reasoning" not in res_none
+    assert translate_request(body_none)["reasoning"] == {"effort": "minimal"}
 
     body_max = {
         "model": "grok-4.7",
         "reasoning_effort": "max",
         "messages": [{"role": "user", "content": "hi"}],
     }
-    res_max = translate_request(body_max)
-    assert res_max["model"] == "grok-4.7-xhigh"
-    assert "reasoning" not in res_max
-
-    # Field mode preserves legacy behavior
-    monkeypatch.setenv("GATEWAY_EFFORT_MODE", "field")
-    f_res1 = translate_request(body1)
-    assert f_res1["model"] == "grok-4.7"
-    assert f_res1["reasoning"] == {"effort": "low"}
-
-    f_res2 = translate_request(body2)
-    assert f_res2["model"] == "grok-4.7"
-    assert f_res2["reasoning"] == {"effort": "high"}
-
-    f_res3 = translate_request(body3)
-    assert f_res3["model"] == "grok-4.7"
-    assert f_res3["reasoning"] == {"effort": "medium"}
-
-    f_res4 = translate_request(body4)
-    assert f_res4["model"] == "grok-4.7"
-    assert f_res4["reasoning"] == {"effort": "high"}
-
-    f_res_none = translate_request(body_none)
-    assert f_res_none["model"] == "grok-4.7"
-    assert f_res_none["reasoning"] == {"effort": "minimal"}
-
-    f_res_max = translate_request(body_max)
-    assert f_res_max["model"] == "grok-4.7"
-    assert f_res_max["reasoning"] == {"effort": "xhigh"}
+    assert translate_request(body_max)["reasoning"] == {"effort": "xhigh"}
 
 
 def test_translate_messages_handles_assistant_with_reasoning_content():
@@ -1332,91 +1298,58 @@ def test_models_created_timestamp_is_recent(store):
         upstream.close()
 
 
-def test_resolve_effort_model_matrix():
-    assert resolve_effort_model("grok-4.7", None) == ("grok-4.7", None)
-    assert resolve_effort_model("grok-4.7", "minimal") == ("grok-4.7-low", None)
-    assert resolve_effort_model("grok-4.7", "low") == ("grok-4.7-low", None)
-    assert resolve_effort_model("grok-4.7", "medium") == ("grok-4.7-medium", None)
-    assert resolve_effort_model("grok-4.7", "high") == ("grok-4.7", None)
-    assert resolve_effort_model("grok-4.7", "xhigh") == ("grok-4.7-xhigh", None)
-    assert resolve_effort_model("grok-4.5", "low") == ("grok-4.5", {"effort": "low"})
-    assert resolve_effort_model("grok-4.6", "xhigh") == ("grok-4.6", {"effort": "xhigh"})
-    assert resolve_effort_model("grok-9.9", "low") == ("grok-9.9", {"effort": "low"})
-    assert resolve_effort_model("grok-4.7", "low", mode="field") == ("grok-4.7", {"effort": "low"})
-    assert resolve_effort_model("grok-4.7", "high", mode="field") == ("grok-4.7", {"effort": "high"})
-
-
-def test_reasoning_effort_variant_mapping():
-    # 1. grok-4.7 + reasoning_effort: "low" -> model grok-4.7-low, no reasoning key
+def test_reasoning_effort_translation():
+    # 1. grok-4.7 + reasoning_effort: "low" -> model grok-4.7, reasoning == {"effort": "low"}
     r1 = translate_request({"model": "grok-4.7", "reasoning_effort": "low"})
-    assert r1["model"] == "grok-4.7-low"
-    assert "reasoning" not in r1
+    assert r1["model"] == "grok-4.7"
+    assert r1.get("reasoning") == {"effort": "low"}
 
-    # 2. grok-4.7 + reasoning: {"effort": "medium"} -> model grok-4.7-medium, no reasoning key
+    # 2. grok-4.7 + reasoning: {"effort": "medium"} -> model grok-4.7, reasoning == {"effort": "medium"}
     r2 = translate_request({"model": "grok-4.7", "reasoning": {"effort": "medium"}})
-    assert r2["model"] == "grok-4.7-medium"
-    assert "reasoning" not in r2
+    assert r2["model"] == "grok-4.7"
+    assert r2.get("reasoning") == {"effort": "medium"}
 
-    # 3. grok-4.7 + reasoning_effort: "xhigh" -> model grok-4.7-xhigh, no reasoning key
+    # 3. grok-4.7 + reasoning_effort: "xhigh", "high", "none" (minimal)
     r3 = translate_request({"model": "grok-4.7", "reasoning_effort": "xhigh"})
-    assert r3["model"] == "grok-4.7-xhigh"
-    assert "reasoning" not in r3
+    assert r3["model"] == "grok-4.7"
+    assert r3.get("reasoning") == {"effort": "xhigh"}
 
-    # 4. grok-4.7 + reasoning_effort: "high" -> model grok-4.7, no reasoning key
     r4 = translate_request({"model": "grok-4.7", "reasoning_effort": "high"})
     assert r4["model"] == "grok-4.7"
-    assert "reasoning" not in r4
+    assert r4.get("reasoning") == {"effort": "high"}
 
-    # 5. grok-4.7 + reasoning_effort: "none" -> model grok-4.7-low (minimal approx by low variant), no reasoning key
     r5 = translate_request({"model": "grok-4.7", "reasoning_effort": "none"})
-    assert r5["model"] == "grok-4.7-low"
-    assert "reasoning" not in r5
+    assert r5["model"] == "grok-4.7"
+    assert r5.get("reasoning") == {"effort": "minimal"}
 
-    # 6. grok-4.7-low as client model, no body effort -> model grok-4.7-low (suffix path, resolved once)
+    # 4. Client model grok-4.7-low, no body effort -> upstream model grok-4.7, reasoning == {"effort": "low"}
     r6 = translate_request({"model": "grok-4.7-low"})
-    assert r6["model"] == "grok-4.7-low"
-    assert "reasoning" not in r6
+    assert r6["model"] == "grok-4.7"
+    assert r6.get("reasoning") == {"effort": "low"}
 
-    # 7. grok-4.5 + reasoning_effort: "low" -> model grok-4.5, reasoning == {"effort": "low"} (field fallback)
+    # 5. grok-4.5 + low, grok-4.6 + xhigh, and an unlisted model (grok-9.9) + low
     r7 = translate_request({"model": "grok-4.5", "reasoning_effort": "low"})
     assert r7["model"] == "grok-4.5"
     assert r7.get("reasoning") == {"effort": "low"}
 
-    # 8. grok-4.6 + reasoning_effort: "xhigh" -> model grok-4.6, reasoning == {"effort": "xhigh"} (field fallback)
     r8 = translate_request({"model": "grok-4.6", "reasoning_effort": "xhigh"})
     assert r8["model"] == "grok-4.6"
     assert r8.get("reasoning") == {"effort": "xhigh"}
 
-    # 9. An unlisted model, e.g. grok-9.9 + reasoning_effort: "low" -> model unchanged, field fallback
     r9 = translate_request({"model": "grok-9.9", "reasoning_effort": "low"})
     assert r9["model"] == "grok-9.9"
     assert r9.get("reasoning") == {"effort": "low"}
 
 
-def test_reasoning_effort_field_mode(monkeypatch):
-    # 10. GATEWAY_EFFORT_MODE=field: grok-4.7 + reasoning_effort: "low" -> model grok-4.7, reasoning == {"effort": "low"}
-    monkeypatch.setenv("GATEWAY_EFFORT_MODE", "field")
-    r10 = translate_request({"model": "grok-4.7", "reasoning_effort": "low"})
-    assert r10["model"] == "grok-4.7"
-    assert r10.get("reasoning") == {"effort": "low"}
-
-    # Invalid mode falls back to variant mode
-    monkeypatch.setenv("GATEWAY_EFFORT_MODE", "invalid-mode")
-    r_inv = translate_request({"model": "grok-4.7", "reasoning_effort": "low"})
-    assert r_inv["model"] == "grok-4.7-low"
-    assert "reasoning" not in r_inv
-
-
 def test_translate_request_logs_debug_effort(caplog):
     with caplog.at_level(logging.DEBUG, logger="grok-gateway"):
         translate_request({"model": "grok-4.7", "reasoning_effort": "low"})
-        assert "effort low mode variant upstream_model grok-4.7-low" in caplog.text
+        assert "effort low upstream_model grok-4.7" in caplog.text
 
 
-def test_e2e_effort_low_returns_client_model_and_calls_variant_upstream(store):
-    # 13. End-to-end with the fake upstream (store fixture):
-    # a chat request grok-4.7 + reasoning_effort: "low" returns 200 and the response body's model is grok-4.7
-    # (the client's string), not the variant id; same for a streaming request's chunks.
+def test_e2e_effort_low_returns_client_model_and_forwards_reasoning_upstream(store):
+    # 7. End-to-end with fake upstream: grok-4.7 + reasoning_effort: "low" returns 200,
+    # payload received has model == grok-4.7 and reasoning == {"effort": "low"}, response model is grok-4.7.
     upstream_payloads = []
 
     def handler(count, payload):
@@ -1437,8 +1370,8 @@ def test_e2e_effort_low_returns_client_model_and_calls_variant_upstream(store):
         assert status == 200
         data = json.loads(raw)
         assert data["model"] == "grok-4.7"
-        assert upstream_payloads[0]["model"] == "grok-4.7-low"
-        assert "reasoning" not in upstream_payloads[0]
+        assert upstream_payloads[0]["model"] == "grok-4.7"
+        assert upstream_payloads[0]["reasoning"] == {"effort": "low"}
 
         # Streaming
         req_stream = {
@@ -1453,15 +1386,16 @@ def test_e2e_effort_low_returns_client_model_and_calls_variant_upstream(store):
         chunks = [json.loads(line) for line in lines if line != "[DONE]"]
         assert len(chunks) >= 1
         assert all(c.get("model") == "grok-4.7" for c in chunks)
-        assert upstream_payloads[1]["model"] == "grok-4.7-low"
-        assert "reasoning" not in upstream_payloads[1]
+        assert upstream_payloads[1]["model"] == "grok-4.7"
+        assert upstream_payloads[1]["reasoning"] == {"effort": "low"}
     finally:
         gateway.close()
         upstream.close()
 
 
 def test_e2e_direct_variant_call_preserves_client_model(store):
-    # 14. Direct variant call still works end-to-end: client model grok-4.7-low returns 200 and response model is grok-4.7-low.
+    # 8. End-to-end: direct client model grok-4.7-low returns 200, response model is grok-4.7-low,
+    # and upstream payload is model grok-4.7 with reasoning == {"effort": "low"}.
     upstream_payloads = []
 
     def handler(count, payload):
@@ -1480,31 +1414,31 @@ def test_e2e_direct_variant_call_preserves_client_model(store):
         assert status == 200
         data = json.loads(raw)
         assert data["model"] == "grok-4.7-low"
-        assert upstream_payloads[0]["model"] == "grok-4.7-low"
-        assert "reasoning" not in upstream_payloads[0]
+        assert upstream_payloads[0]["model"] == "grok-4.7"
+        assert upstream_payloads[0]["reasoning"] == {"effort": "low"}
     finally:
         gateway.close()
         upstream.close()
 
 
 def test_reasoning_default_effort_env(monkeypatch):
-    # 11. GATEWAY_DEFAULT_EFFORT=low, request with no effort -> model grok-4.7-low;
-    # and the same env set but the request carries reasoning_effort: "medium" -> grok-4.7-medium (client wins over default).
+    # 6. GATEWAY_DEFAULT_EFFORT=low, request with no effort -> model grok-4.7, reasoning == {"effort": "low"}
     monkeypatch.setenv("GATEWAY_DEFAULT_EFFORT", "low")
     r_def = translate_request({"model": "grok-4.7"})
-    assert r_def["model"] == "grok-4.7-low"
-    assert "reasoning" not in r_def
+    assert r_def["model"] == "grok-4.7"
+    assert r_def.get("reasoning") == {"effort": "low"}
 
+    # Client effort wins over default
     r_client_wins = translate_request({"model": "grok-4.7", "reasoning_effort": "medium"})
-    assert r_client_wins["model"] == "grok-4.7-medium"
-    assert "reasoning" not in r_client_wins
+    assert r_client_wins["model"] == "grok-4.7"
+    assert r_client_wins.get("reasoning") == {"effort": "medium"}
 
     # Suffix also wins over default effort
     r_suffix_wins = translate_request({"model": "grok-4.7-medium"})
-    assert r_suffix_wins["model"] == "grok-4.7-medium"
-    assert "reasoning" not in r_suffix_wins
+    assert r_suffix_wins["model"] == "grok-4.7"
+    assert r_suffix_wins.get("reasoning") == {"effort": "medium"}
 
-    # 12. GATEWAY_DEFAULT_EFFORT=banana, request with no effort -> base behavior (model grok-4.7, no reasoning key).
+    # Invalid default effort (banana) is ignored
     monkeypatch.setenv("GATEWAY_DEFAULT_EFFORT", "banana")
     r_inv = translate_request({"model": "grok-4.7"})
     assert r_inv["model"] == "grok-4.7"
