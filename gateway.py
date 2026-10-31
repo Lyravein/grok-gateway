@@ -197,7 +197,7 @@ class AccountStore:
                 future = [
                     self._entry(a)["exhausted_until"]
                     for a in self._accounts if a not in self._pending and a not in exclude
-                    and "exhausted_until" in self._entry(a)
+                    and self._entry(a).get("exhausted_until", 0) > now
                 ]
                 if future:
                     raise NoAccountAvailable("exhausted", min(future))
@@ -860,11 +860,12 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
             if not self._authorized():
                 self.close_connection = True
                 return _error(self, 401, "unauthorized", "unauthorized")
+            now = int(time.time())
             data = [
                 {
                     "id": m,
                     "object": "model",
-                    "created": 1700000000,
+                    "created": now,
                     "owned_by": "xai",
                     "permission": [],
                     "root": m,
@@ -875,6 +876,40 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
             return _json_response(self, 200, {"object": "list", "data": data})
         return _error(self, 404, "not found", "not_found")
 
+    def _read_chunked_body(self):
+        chunks = []
+        total = 0
+        while True:
+            line = self.rfile.readline()
+            if not line:
+                break
+            line = line.strip()
+            if not line:
+                continue
+            size_part = line.split(b";")[0].strip()
+            try:
+                chunk_size = int(size_part, 16)
+            except ValueError:
+                raise ValueError("invalid chunk size")
+            if chunk_size == 0:
+                while True:
+                    trailer = self.rfile.readline()
+                    if not trailer or trailer in (b"\r\n", b"\n"):
+                        break
+                break
+            total += chunk_size
+            if total > self.state.max_body_bytes:
+                raise OverflowError("request too large")
+            chunk_data = bytearray()
+            while len(chunk_data) < chunk_size:
+                part = self.rfile.read(chunk_size - len(chunk_data))
+                if not part:
+                    raise ValueError("truncated chunk")
+                chunk_data.extend(part)
+            chunks.append(bytes(chunk_data))
+            self.rfile.readline()
+        return b"".join(chunks)
+
     def do_POST(self):
         path = self.path.split("?")[0].rstrip("/")
         if path not in ("/v1/chat/completions", "/chat/completions"):
@@ -882,17 +917,28 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
         if not self._authorized():
             self.close_connection = True
             return _error(self, 401, "unauthorized", "unauthorized")
-        try:
-            length = int(self.headers.get("Content-Length") or 0)
-        except ValueError:
-            return _error(self, 400, "bad request", "invalid_request")
-        if length < 0:
-            self.close_connection = True
-            return _error(self, 400, "bad request", "invalid_request")
-        if length > self.state.max_body_bytes:
-            self.close_connection = True
-            return _error(self, 413, "request too large", "request_too_large")
-        raw = self.rfile.read(length) if length else b""
+        te = self.headers.get("Transfer-Encoding", "").lower()
+        if "chunked" in te:
+            try:
+                raw = self._read_chunked_body()
+            except OverflowError:
+                self.close_connection = True
+                return _error(self, 413, "request too large", "request_too_large")
+            except ValueError:
+                self.close_connection = True
+                return _error(self, 400, "bad request", "invalid_request")
+        else:
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                return _error(self, 400, "bad request", "invalid_request")
+            if length < 0:
+                self.close_connection = True
+                return _error(self, 400, "bad request", "invalid_request")
+            if length > self.state.max_body_bytes:
+                self.close_connection = True
+                return _error(self, 413, "request too large", "request_too_large")
+            raw = self.rfile.read(length) if length else b""
         try:
             body = json.loads(raw)
             if not isinstance(body, dict):

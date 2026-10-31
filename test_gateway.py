@@ -1214,6 +1214,90 @@ def test_stream_opens_with_single_role_chunk(store):
         upstream.close()
 
 
+def test_chunked_transfer_encoding_and_oversize(store):
+    upstream = FakeUpstream(lambda count, payload: (200, "".join(text_events("chunked-ok"))))
+    gateway = RunningGateway(store, upstream.url)
+    try:
+        # Valid chunked request
+        body_bytes = json.dumps(chat()).encode("utf-8")
+        conn = http.client.HTTPConnection("127.0.0.1", gateway.port, timeout=5)
+        conn.request("POST", "/v1/chat/completions", body=[body_bytes], headers={
+            "Authorization": "Bearer gateway-secret",
+            "Content-Type": "application/json",
+            "Transfer-Encoding": "chunked",
+        }, encode_chunked=True)
+        res = conn.getresponse()
+        assert res.status == 200
+        data = json.loads(res.read().decode())
+        assert data["choices"][0]["message"]["content"] == "chunked-ok"
+        conn.close()
+
+        # Oversize chunked request (> 16MB)
+        conn = http.client.HTTPConnection("127.0.0.1", gateway.port, timeout=5)
+        large_chunk = b"x" * (1024 * 1024)
+
+        def gen():
+            for _ in range(17):
+                yield large_chunk
+
+        conn.request("POST", "/v1/chat/completions", body=gen(), headers={
+            "Authorization": "Bearer gateway-secret",
+            "Content-Type": "application/json",
+            "Transfer-Encoding": "chunked",
+        }, encode_chunked=True)
+        res_large = conn.getresponse()
+        assert res_large.status == 413
+        err = json.loads(res_large.read().decode())["error"]
+        assert err["code"] == "request_too_large"
+        conn.close()
+    finally:
+        gateway.close()
+        upstream.close()
+
+
+def test_cooldown_with_expired_exhaustion_reports_busy(tmp_path):
+    accounts = [account("single")]
+    store = AccountStore(accounts, str(tmp_path / "state.json"))
+    store._entry("single")["exhausted_until"] = 1000.0  # past expired
+    store.cooldown("single")
+
+    upstream = FakeUpstream(lambda count, payload: (200, "".join(text_events())))
+    gateway = RunningGateway(store, upstream.url)
+    try:
+        status, raw = gateway.post(chat())
+        assert status == 503
+        data = json.loads(raw)
+        assert data["error"]["code"] == "busy"
+
+        # Genuinely future exhaustion yields 429
+        store._entry("single")["exhausted_until"] = time.time() + 3600
+        status2, raw2 = gateway.post(chat())
+        assert status2 == 429
+        data2 = json.loads(raw2)
+        assert data2["error"]["code"] == "rate_limited"
+    finally:
+        gateway.close()
+        upstream.close()
+
+
+def test_models_created_timestamp_is_recent(store):
+    upstream = FakeUpstream(lambda count, payload: (200, "".join(text_events())))
+    gateway = RunningGateway(store, upstream.url)
+    try:
+        conn = http.client.HTTPConnection("127.0.0.1", gateway.port, timeout=5)
+        conn.request("GET", "/v1/models", headers={"Authorization": "Bearer gateway-secret"})
+        res = conn.getresponse()
+        assert res.status == 200
+        data = json.loads(res.read().decode())
+        now = time.time()
+        for m in data["data"]:
+            assert abs(m["created"] - now) < 10
+        conn.close()
+    finally:
+        gateway.close()
+        upstream.close()
+
+
 
 
 
