@@ -55,6 +55,8 @@ chmod 600 ~/.config/grok-gateway/env
 | `GATEWAY_PORT` | `8787` | Port for the HTTP server |
 | `GROK_MAX_ATTEMPTS` | `8` | Maximum number of account rotation attempts before failing |
 | `GROK_TIMEOUT` | `300` | Upstream HTTP timeout in seconds |
+| `GATEWAY_DEFAULT_EFFORT` | *(Unset)* | Default reasoning effort applied when request carries no effort or suffix (`low`, `medium`, `high`, `xhigh`, `minimal`) |
+| `GATEWAY_EFFORT_MODE` | `variant` | Effort translation mode: `variant` (maps effort to upstream model variants) or `field` (legacy field forwarding) |
 
 ### 4. Run the Gateway
 
@@ -101,7 +103,7 @@ Configure your client to point to the local gateway:
 - **API Key**: The value of your `GATEWAY_API_KEY`
 - **Supported Models**: `grok-4.7`, `grok-4.7-high`, `grok-4.7-xhigh`, `grok-4.7-medium`, `grok-4.7-low`, `grok-4.6`, `grok-4.6-high`, `grok-4.5`
 - **Reasoning / Thinking**: Supported out of the box via `choices[0].delta.reasoning_content`.
-- **Reasoning Effort Control**: Can be specified via `reasoning_effort` ("low", "medium", "high", "xhigh"), the `reasoning: {effort: "high"}` object, or by using model name suffixes (e.g. `grok-4.7-high`).
+- **Reasoning Effort Control**: Can be specified via `reasoning_effort` ("low", "medium", "high", "xhigh"), the `reasoning: {effort: "high"}` object, or by using model name suffixes (e.g. `grok-4.7-high`). In default `variant` mode, requests are translated directly to upstream model variants (`grok-4.7-low`, `grok-4.7-medium`, `grok-4.7-xhigh`) for reliable control over thinking time and token usage, while falling back to field forwarding for models without variants. Default gateway-side effort can also be configured with `GATEWAY_DEFAULT_EFFORT`.
 
 ### Wire into 9Router
 
