@@ -4,6 +4,8 @@ See plan.md for the specification. Python 3.10+ standard library only.
 """
 
 import argparse
+import collections
+import hashlib
 import hmac
 import http.client
 import json
@@ -271,6 +273,70 @@ def contains_exhaustion(text):
     return any(code in low for code in EXHAUSTED_CODES)
 
 
+class ReasoningCache:
+    """Thread-safe LRU cache storing upstream reasoning items for multi-turn replay."""
+
+    def __init__(self, max_entries=2000):
+        self._max = max_entries
+        self._lock = threading.Lock()
+        self._by_call_id = collections.OrderedDict()
+        self._by_text = collections.OrderedDict()
+
+    def put(self, call_id, item):
+        if not call_id or not isinstance(item, dict):
+            return
+        clean_item = {
+            "type": "reasoning",
+            "summary": item.get("summary") or [],
+        }
+        if item.get("id"):
+            clean_item["id"] = item["id"]
+        if item.get("encrypted_content"):
+            clean_item["encrypted_content"] = item["encrypted_content"]
+        with self._lock:
+            self._by_call_id[str(call_id)] = clean_item
+            if len(self._by_call_id) > self._max:
+                self._by_call_id.popitem(last=False)
+
+    def get(self, call_id):
+        if not call_id:
+            return None
+        with self._lock:
+            item = self._by_call_id.get(str(call_id))
+            if item:
+                self._by_call_id.move_to_end(str(call_id))
+                return dict(item)
+            return None
+
+    def put_by_text(self, text, item):
+        if not text or not isinstance(item, dict):
+            return
+        key = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        clean_item = {
+            "type": "reasoning",
+            "summary": item.get("summary") or [],
+        }
+        if item.get("id"):
+            clean_item["id"] = item["id"]
+        if item.get("encrypted_content"):
+            clean_item["encrypted_content"] = item["encrypted_content"]
+        with self._lock:
+            self._by_text[key] = clean_item
+            if len(self._by_text) > self._max:
+                self._by_text.popitem(last=False)
+
+    def get_by_text(self, text):
+        if not text:
+            return None
+        key = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        with self._lock:
+            item = self._by_text.get(key)
+            if item:
+                self._by_text.move_to_end(key)
+                return dict(item)
+            return None
+
+
 # --------------------------------------------------------------------------
 # Request conversion: [OI] chat completions -> Responses API
 # --------------------------------------------------------------------------
@@ -290,7 +356,7 @@ def text_of(content):
     return ""
 
 
-def translate_messages(messages):
+def translate_messages(messages, reasoning_cache=None):
     instructions, items = [], []
     for message in messages or []:
         role = message.get("role")
@@ -301,6 +367,19 @@ def translate_messages(messages):
         elif role == "user":
             items.append({"role": "user", "content": [{"type": "input_text", "text": text}]})
         elif role == "assistant":
+            cached_reasoning = None
+            for call in message.get("tool_calls") or []:
+                cid = call.get("id")
+                if cid and reasoning_cache:
+                    cached_reasoning = reasoning_cache.get(cid)
+                    if cached_reasoning:
+                        break
+            if cached_reasoning is None and text and reasoning_cache:
+                cached_reasoning = reasoning_cache.get_by_text(text)
+
+            if cached_reasoning:
+                items.append(cached_reasoning)
+
             if text:
                 items.append({"role": "assistant", "content": [{"type": "output_text", "text": text}]})
             for call in message.get("tool_calls") or []:
@@ -320,7 +399,7 @@ def translate_messages(messages):
     return "\n\n".join(instructions), items
 
 
-def translate_request(body):
+def translate_request(body, reasoning_cache=None):
     raw_model = str(body.get("model") or "grok-4.7").strip()
     model = raw_model.split("/")[-1] if "/" in raw_model else raw_model
     effort = None
@@ -336,8 +415,13 @@ def translate_request(body):
                 break
     if model in ("", "grok"):
         model = "grok-4.7"
-    instructions, items = translate_messages(body.get("messages"))
-    result = {"model": model, "input": items, "stream": True}
+    instructions, items = translate_messages(body.get("messages"), reasoning_cache=reasoning_cache)
+    result = {
+        "model": model,
+        "input": items,
+        "stream": True,
+        "include": ["reasoning.encrypted_content"],
+    }
     if instructions:
         result["instructions"] = instructions
     if "max_tokens" in body:
@@ -377,6 +461,8 @@ class ResponsesTranslator:
         self.calls = []
         self.content = ""
         self.reasoning = ""
+        self.reasoning_items = []
+        self._last_reasoning_item = None
         self.usage = None
         self.finish_reason = None
         self._by_index, self._by_id = {}, {}
@@ -385,6 +471,14 @@ class ResponsesTranslator:
         self._complete = set()
 
     # -- helpers ----------------------------------------------------------
+
+    def get_reasoning_item(self):
+        for item in reversed(self.reasoning_items):
+            if item.get("encrypted_content"):
+                return item
+        if self.reasoning_items:
+            return self.reasoning_items[-1]
+        return self._last_reasoning_item
 
     def _resolve(self, output_index, item_id):
         by_index = self._by_index.get(output_index)
@@ -463,7 +557,11 @@ class ResponsesTranslator:
 
     def _on_response_output_item_added(self, event):
         item = event.get("item") or {}
-        if item.get("type") != "function_call":
+        itype = item.get("type")
+        if itype == "reasoning":
+            self._last_reasoning_item = dict(item)
+            return []
+        if itype != "function_call":
             return []
         if not item.get("name"):
             raise ProtocolError("tool call without a name")
@@ -487,7 +585,13 @@ class ResponsesTranslator:
 
     def _on_response_output_item_done(self, event):
         item = event.get("item") or {}
-        if item.get("type") not in (None, "function_call"):
+        itype = item.get("type")
+        if itype == "reasoning":
+            completed_item = dict(item)
+            self._last_reasoning_item = completed_item
+            self.reasoning_items.append(completed_item)
+            return []
+        if itype not in (None, "function_call"):
             return []
         output_index, item_id = event.get("output_index"), item.get("id")
         call = self._resolve(output_index, item_id)
@@ -560,7 +664,7 @@ def make_tls_context():
 # --------------------------------------------------------------------------
 
 class GatewayState:
-    def __init__(self, store, upstream_url, api_key, timeout, max_attempts, max_body_bytes):
+    def __init__(self, store, upstream_url, api_key, timeout, max_attempts, max_body_bytes, reasoning_cache=None):
         self.store = store
         self.upstream_url = upstream_url
         self.api_key = api_key
@@ -571,6 +675,7 @@ class GatewayState:
         self.db_path = getattr(store, "source", None)
         self._reload_lock = threading.Lock()
         self._last_load = 0.0
+        self.reasoning_cache = reasoning_cache if reasoning_cache is not None else ReasoningCache()
 
     def reload(self):
         """Re-read credentials from 9Router at most once every 30 seconds."""
@@ -734,7 +839,7 @@ class Context:
     def run(self, handler):
         self.handler = handler
         try:
-            self.upstream_body = translate_request(self.body)
+            self.upstream_body = translate_request(self.body, reasoning_cache=self.state.reasoning_cache)
         except Exception:
             log.error("request %s: bad request body", self.request_id)
             return _error(handler, 400, "invalid request", "invalid_request")
@@ -855,6 +960,7 @@ class Context:
                 if not ended:
                     raise ProtocolError("stream ended without completion")
                 finish_reason, usage = translator.finish()
+                self._record_reasoning(translator)
                 self._deliver(translator, finish_reason, usage)
                 return "done"
             except ProtocolError as error:
@@ -875,6 +981,21 @@ class Context:
         finally:
             response.close()
 
+    def _record_reasoning(self, translator):
+        cache = getattr(self.state, "reasoning_cache", None)
+        if not cache:
+            return
+        reasoning_item = translator.get_reasoning_item()
+        if not reasoning_item:
+            return
+        for call in translator.calls:
+            cid = call.get("id")
+            if cid:
+                cache.put(cid, reasoning_item)
+        text = str(translator.content).strip()
+        if text:
+            cache.put_by_text(text, reasoning_item)
+
     def _read_body(self, error):
         try:
             return (error.read() or b"").decode("utf-8", "replace")
@@ -889,6 +1010,7 @@ class Context:
             self.state.store.cooldown(account.id)
             return "retry"
         # 400/401/403/404 etc: a request or credential problem, never quota.
+        log.warning("request %s: upstream HTTP %s: %s", self.request_id, status, body)
         _error(self.handler, 502, "upstream rejected request", "upstream_error")
         return "fatal"
 

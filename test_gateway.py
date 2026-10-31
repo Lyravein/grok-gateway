@@ -16,6 +16,7 @@ from gateway import (
     AccountStore,
     NoAccountAvailable,
     ProtocolError,
+    ReasoningCache,
     ResponsesTranslator,
     load_accounts,
     make_server,
@@ -829,6 +830,144 @@ def test_response_incomplete_sets_finish_reason_length(store):
         assert lines[-1] == "[DONE]"
         chunks = [json.loads(line) for line in lines[:-1]]
         assert chunks[-1]["choices"][0]["finish_reason"] == "length"
+    finally:
+        gateway.close()
+        upstream.close()
+
+
+def test_reasoning_cache_lru_and_lookups():
+    cache = ReasoningCache(max_entries=2)
+    item1 = {"type": "reasoning", "summary": [], "encrypted_content": "enc1"}
+    item2 = {"type": "reasoning", "summary": [], "encrypted_content": "enc2"}
+    item3 = {"type": "reasoning", "summary": [], "encrypted_content": "enc3"}
+
+    cache.put("call1", item1)
+    cache.put("call2", item2)
+    res1 = cache.get("call1")
+    assert res1 is not None and res1["encrypted_content"] == "enc1"
+
+    # Eviction: adding item3 evicts call2 because call1 was accessed
+    cache.put("call3", item3)
+    assert cache.get("call1") is not None
+    assert cache.get("call2") is None
+    assert cache.get("call3") is not None
+
+    # By text lookup
+    cache.put_by_text("hello assistant", item1)
+    res_text = cache.get_by_text("hello assistant")
+    assert res_text is not None and res_text["encrypted_content"] == "enc1"
+    assert cache.get_by_text("other text") is None
+
+
+def test_responses_translator_captures_reasoning_item():
+    translator = ResponsesTranslator()
+    translator.feed({"type": "response.output_item.added", "item": {
+        "id": "rs_1", "type": "reasoning", "status": "in_progress", "summary": []
+    }})
+    translator.feed({"type": "response.output_item.done", "item": {
+        "id": "rs_1", "type": "reasoning", "status": "completed",
+        "summary": [], "encrypted_content": "secret_blob",
+    }})
+    item = translator.get_reasoning_item()
+    assert item is not None
+    assert item["encrypted_content"] == "secret_blob"
+    assert item["type"] == "reasoning"
+
+
+def test_translate_messages_stitches_cached_reasoning():
+    cache = ReasoningCache()
+    cache.put("call_abc", {"type": "reasoning", "summary": [], "encrypted_content": "cipher_xyz"})
+    messages = [
+        {"role": "user", "content": "do task"},
+        {"role": "assistant", "content": None, "tool_calls": [{
+            "id": "call_abc",
+            "type": "function",
+            "function": {"name": "terminal", "arguments": "{}"},
+        }]},
+        {"role": "tool", "tool_call_id": "call_abc", "content": "result"},
+    ]
+    _, items = translate_messages(messages, reasoning_cache=cache)
+    assert len(items) == 4
+    assert items[0] == {"role": "user", "content": [{"type": "input_text", "text": "do task"}]}
+    assert items[1] == {"type": "reasoning", "summary": [], "encrypted_content": "cipher_xyz"}
+    assert items[2]["type"] == "function_call"
+    assert items[2]["call_id"] == "call_abc"
+    assert items[3]["type"] == "function_call_output"
+
+
+def test_end_to_end_reasoning_stitching_multi_turn(store):
+    recorded_payloads = []
+
+    def handle(count, payload):
+        recorded_payloads.append(payload)
+        if count == 1:
+            events = [
+                sse({"type": "response.output_item.added", "item": {
+                    "id": "rs_t1", "type": "reasoning", "status": "in_progress", "summary": []
+                }}),
+                sse({"type": "response.output_item.done", "item": {
+                    "id": "rs_t1", "type": "reasoning", "status": "completed",
+                    "summary": [], "encrypted_content": "e2e_trace_blob"
+                }}),
+                sse({"type": "response.output_item.added", "output_index": 1, "item": {
+                    "type": "function_call", "id": "fc_1", "call_id": "call_99", "name": "read_file"
+                }}),
+                sse({"type": "response.function_call_arguments.done", "output_index": 1, "item_id": "fc_1"}),
+                sse({"type": "response.output_item.done", "output_index": 1, "item": {
+                    "type": "function_call", "id": "fc_1", "call_id": "call_99", "name": "read_file",
+                    "arguments": "{\"path\": \"package.json\"}"
+                }}),
+                sse({"type": "response.completed", "response": {}}),
+                "data: [DONE]\n\n",
+            ]
+            return 200, "".join(events)
+        else:
+            events = [
+                sse({"type": "response.output_text.delta", "delta": "All done"}),
+                sse({"type": "response.completed", "response": {}}),
+                "data: [DONE]\n\n",
+            ]
+            return 200, "".join(events)
+
+    upstream = FakeUpstream(handle)
+    gateway = RunningGateway(store, upstream.url)
+    try:
+        # Turn 1: Client sends initial user message
+        req1 = {
+            "model": "grok-4.7",
+            "messages": [{"role": "user", "content": "check dependencies"}],
+            "stream": True,
+        }
+        status1, raw1 = gateway.post(req1)
+        assert status1 == 200
+        assert "call_99" in raw1
+
+        # Turn 2: Client sends conversation history including the tool call result
+        req2 = {
+            "model": "grok-4.7",
+            "messages": [
+                {"role": "user", "content": "check dependencies"},
+                {"role": "assistant", "content": None, "tool_calls": [{
+                    "id": "call_99", "type": "function",
+                    "function": {"name": "read_file", "arguments": "{\"path\": \"package.json\"}"}
+                }]},
+                {"role": "tool", "tool_call_id": "call_99", "content": "{}"},
+            ],
+            "stream": True,
+        }
+        status2, raw2 = gateway.post(req2)
+        assert status2 == 200
+
+        # Assert Turn 2 payload delivered to upstream has the stitched reasoning item!
+        assert len(recorded_payloads) == 2
+        turn2_payload = recorded_payloads[1]
+        turn2_input = turn2_payload["input"]
+        # input[0] is user, input[1] is stitched reasoning, input[2] is function_call, input[3] is function_call_output
+        assert turn2_input[0]["role"] == "user"
+        assert turn2_input[1]["type"] == "reasoning"
+        assert turn2_input[1]["encrypted_content"] == "e2e_trace_blob"
+        assert turn2_input[2]["type"] == "function_call"
+        assert turn2_input[3]["type"] == "function_call_output"
     finally:
         gateway.close()
         upstream.close()
