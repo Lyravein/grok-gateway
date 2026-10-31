@@ -429,6 +429,18 @@ def translate_messages(messages, reasoning_cache=None):
     return "\n\n".join(instructions), items
 
 
+VALID_EFFORTS = {"minimal", "low", "medium", "high", "xhigh"}
+EFFORT_MAP = {
+    "none": "minimal",
+    "off": "minimal",
+    "disabled": "minimal",
+    "false": "minimal",
+    "0": "minimal",
+    "max": "xhigh",
+    "ultra": "xhigh",
+}
+
+
 def translate_request(body, reasoning_cache=None):
     raw_model = str(body.get("model") or "grok-4.7").strip()
     model = raw_model.split("/")[-1] if "/" in raw_model else raw_model
@@ -446,6 +458,10 @@ def translate_request(body, reasoning_cache=None):
     if model in ("", "grok"):
         model = "grok-4.7"
     instructions, items = translate_messages(body.get("messages"), reasoning_cache=reasoning_cache)
+    extra_instructions = os.environ.get("GATEWAY_EXTRA_INSTRUCTIONS", "").strip()
+    if extra_instructions:
+        instructions = (instructions + "\n\n" + extra_instructions).strip() if instructions else extra_instructions
+
     result = {
         "model": model,
         "input": items,
@@ -460,7 +476,8 @@ def translate_request(body, reasoning_cache=None):
     elif "max_completion_tokens" in body:
         result["max_output_tokens"] = body["max_completion_tokens"]
     if effort:
-        result["reasoning"] = {"effort": effort}
+        effort_norm = EFFORT_MAP.get(effort, effort)
+        result["reasoning"] = {"effort": effort_norm if effort_norm in VALID_EFFORTS else "minimal"}
 
     rf = body.get("response_format")
     if isinstance(rf, dict):

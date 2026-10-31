@@ -711,6 +711,21 @@ def test_translate_request_extracts_reasoning_effort_from_body():
     result5 = translate_request(body5)
     assert result5["model"] == "grok-4.7"
 
+    # Unsupported efforts are normalized to prevent upstream HTTP 400
+    body_none = {
+        "model": "grok-4.7",
+        "reasoning_effort": "none",
+        "messages": [{"role": "user", "content": "hi"}],
+    }
+    assert translate_request(body_none)["reasoning"] == {"effort": "minimal"}
+
+    body_max = {
+        "model": "grok-4.7",
+        "reasoning_effort": "max",
+        "messages": [{"role": "user", "content": "hi"}],
+    }
+    assert translate_request(body_max)["reasoning"] == {"effort": "xhigh"}
+
 
 def test_translate_messages_handles_assistant_with_reasoning_content():
     messages = [
