@@ -447,7 +447,10 @@ def test_terminal_protocol_failure_returns_http_error(store):
     try:
         status, raw = gateway.post(chat())
         assert status == 502
-        assert json.loads(raw)["error"]["type"] == "upstream_error"
+        err = json.loads(raw)["error"]
+        assert err["type"] == "server_error"
+        assert err["code"] == "upstream_error"
+        assert err["param"] is None
         assert len(upstream.calls) == 1
     finally:
         gateway.close()
@@ -488,7 +491,10 @@ def test_tool_item_start_disables_retry(store):
     try:
         status, raw = gateway.post(chat(stream=True))
         assert status == 502
-        assert json.loads(raw)["error"]["type"] == "upstream_error"
+        err = json.loads(raw)["error"]
+        assert err["type"] == "server_error"
+        assert err["code"] == "upstream_error"
+        assert err["param"] is None
         assert len(upstream.calls) == 1
     finally:
         gateway.close()
@@ -1089,13 +1095,61 @@ def test_translate_request_sampling_and_metadata():
     res = translate_request(body)
     assert res["temperature"] == 0.7
     assert res["top_p"] == 0.9
-    assert res["presence_penalty"] == 0.2
-    assert res["frequency_penalty"] == 0.3
-    assert res["seed"] == 42
-    assert res["stop"] == ["STOP"]
-    assert res["user"] == "client-uid"
-    assert "metadata" not in res
+    for k in ("presence_penalty", "frequency_penalty", "seed", "stop", "user", "metadata"):
+        assert k not in res
     assert res["store"] is False
+
+
+def test_error_shape_across_status_families(store):
+    upstream = FakeUpstream(lambda count, payload: (200, "".join(text_events())))
+    gateway = RunningGateway(store, upstream.url)
+    try:
+        # 401 Unauthorized
+        conn = http.client.HTTPConnection("127.0.0.1", gateway.port, timeout=5)
+        conn.request("POST", "/v1/chat/completions", "{}", {"Content-Type": "application/json", "Authorization": "Bearer wrong"})
+        r401 = conn.getresponse()
+        assert r401.status == 401
+        e401 = json.loads(r401.read().decode())["error"]
+        assert e401["type"] == "authentication_error"
+        assert e401["code"] == "unauthorized"
+        assert e401["param"] is None
+        conn.close()
+
+        # 404 Not Found
+        conn = http.client.HTTPConnection("127.0.0.1", gateway.port, timeout=5)
+        conn.request("GET", "/nonexistent", headers={"Authorization": "Bearer gateway-secret"})
+        r404 = conn.getresponse()
+        assert r404.status == 404
+        e404 = json.loads(r404.read().decode())["error"]
+        assert e404["type"] == "invalid_request_error"
+        assert e404["code"] == "not_found"
+        assert e404["param"] is None
+        conn.close()
+
+        # 400 Invalid JSON
+        conn = http.client.HTTPConnection("127.0.0.1", gateway.port, timeout=5)
+        conn.request("POST", "/v1/chat/completions", "{bad json", {"Content-Type": "application/json", "Authorization": "Bearer gateway-secret"})
+        r400 = conn.getresponse()
+        assert r400.status == 400
+        e400 = json.loads(r400.read().decode())["error"]
+        assert e400["type"] == "invalid_request_error"
+        assert e400["code"] == "invalid_request"
+        assert e400["param"] is None
+        conn.close()
+
+        # 413 Request Too Large
+        conn = http.client.HTTPConnection("127.0.0.1", gateway.port, timeout=5)
+        conn.request("POST", "/v1/chat/completions", "", {"Content-Type": "application/json", "Authorization": "Bearer gateway-secret", "Content-Length": str(16 * 1024 * 1024 + 10)})
+        r413 = conn.getresponse()
+        assert r413.status == 413
+        e413 = json.loads(r413.read().decode())["error"]
+        assert e413["type"] == "invalid_request_error"
+        assert e413["code"] == "request_too_large"
+        assert e413["param"] is None
+        conn.close()
+    finally:
+        gateway.close()
+        upstream.close()
 
 
 def test_upstream_error_body_sentinel_never_logged(store, caplog):

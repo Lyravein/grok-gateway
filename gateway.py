@@ -486,13 +486,12 @@ def translate_request(body, reasoning_cache=None):
     if "parallel_tool_calls" in body:
         result["parallel_tool_calls"] = bool(body["parallel_tool_calls"])
 
-    for param in ("temperature", "top_p", "presence_penalty", "frequency_penalty", "seed"):
+    for param in ("temperature", "top_p"):
         if param in body and isinstance(body[param], (int, float)):
             result[param] = body[param]
-    if "stop" in body and isinstance(body["stop"], (str, list)):
-        result["stop"] = body["stop"]
-    if "user" in body and isinstance(body["user"], str):
-        result["user"] = body["user"]
+    dropped = [k for k in ("presence_penalty", "frequency_penalty", "seed", "stop") if k in body]
+    if dropped:
+        log.debug("dropped unsupported chat parameters: %s", ", ".join(dropped))
 
     return result
 
@@ -777,8 +776,38 @@ def _json_response(handler, status, payload, headers=None):
     handler.wfile.write(raw)
 
 
-def _error(handler, status, message, code="error", headers=None):
-    _json_response(handler, status, {"error": {"message": message, "type": code}}, headers)
+def _error(handler, status, message, code=None, headers=None):
+    if status == 400:
+        err_type = "invalid_request_error"
+        err_code = code if code and code != "error" else "invalid_request"
+    elif status == 401:
+        err_type = "authentication_error"
+        err_code = code if code and code != "error" else "invalid_api_key"
+    elif status == 404:
+        err_type = "invalid_request_error"
+        err_code = "not_found"
+    elif status == 413:
+        err_type = "invalid_request_error"
+        err_code = "request_too_large"
+    elif status == 429:
+        err_type = "rate_limit_error"
+        err_code = code if code and code != "error" else "rate_limit_exceeded"
+    elif status >= 500:
+        err_type = "server_error"
+        err_code = code if code and code != "error" else "server_error"
+    else:
+        err_type = "invalid_request_error"
+        err_code = code or "error"
+
+    payload = {
+        "error": {
+            "message": message,
+            "type": err_type,
+            "code": err_code,
+            "param": None,
+        }
+    }
+    _json_response(handler, status, payload, headers)
 
 
 def _chunk(choices=None, model="grok", completion_id=None, **extra):
