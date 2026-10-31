@@ -1487,6 +1487,30 @@ def test_e2e_direct_variant_call_preserves_client_model(store):
         upstream.close()
 
 
+def test_reasoning_default_effort_env(monkeypatch):
+    # 11. GATEWAY_DEFAULT_EFFORT=low, request with no effort -> model grok-4.7-low;
+    # and the same env set but the request carries reasoning_effort: "medium" -> grok-4.7-medium (client wins over default).
+    monkeypatch.setenv("GATEWAY_DEFAULT_EFFORT", "low")
+    r_def = translate_request({"model": "grok-4.7"})
+    assert r_def["model"] == "grok-4.7-low"
+    assert "reasoning" not in r_def
+
+    r_client_wins = translate_request({"model": "grok-4.7", "reasoning_effort": "medium"})
+    assert r_client_wins["model"] == "grok-4.7-medium"
+    assert "reasoning" not in r_client_wins
+
+    # Suffix also wins over default effort
+    r_suffix_wins = translate_request({"model": "grok-4.7-medium"})
+    assert r_suffix_wins["model"] == "grok-4.7-medium"
+    assert "reasoning" not in r_suffix_wins
+
+    # 12. GATEWAY_DEFAULT_EFFORT=banana, request with no effort -> base behavior (model grok-4.7, no reasoning key).
+    monkeypatch.setenv("GATEWAY_DEFAULT_EFFORT", "banana")
+    r_inv = translate_request({"model": "grok-4.7"})
+    assert r_inv["model"] == "grok-4.7"
+    assert "reasoning" not in r_inv
+
+
 
 
 

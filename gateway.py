@@ -453,6 +453,14 @@ def translate_request(body, reasoning_cache=None):
             if model.endswith(suffix):
                 model, effort = model[: -len(suffix)], suffix[1:]
                 break
+
+    if not effort:
+        default_effort = os.environ.get("GATEWAY_DEFAULT_EFFORT", "").strip().lower()
+        if default_effort:
+            norm_default = EFFORT_MAP.get(default_effort, default_effort)
+            if norm_default in VALID_EFFORTS:
+                effort = norm_default
+
     if model in ("", "grok"):
         model = "grok-4.7"
 
