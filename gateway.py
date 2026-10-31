@@ -813,8 +813,8 @@ def _error(handler, status, message, code="error", headers=None):
     _json_response(handler, status, {"error": {"message": message, "type": code}}, headers)
 
 
-def _chunk(choices=None, model="grok", **extra):
-    payload = {"id": "chatcmpl-gateway", "object": "chat.completion.chunk",
+def _chunk(choices=None, model="grok", completion_id=None, **extra):
+    payload = {"id": completion_id or "chatcmpl-gateway", "object": "chat.completion.chunk",
                "created": int(time.time()), "model": model, "choices": choices or []}
     payload.update(extra)
     return payload
@@ -911,6 +911,7 @@ class Context:
         self.state = state
         self.body = body
         self.request_id = os.urandom(6).hex()
+        self.completion_id = "chatcmpl-" + self.request_id
         self.tried = set()
         self.stream = bool(body.get("stream"))
         self._stream_started = False
@@ -1117,6 +1118,7 @@ class Context:
             self.handler.send_header(key, value)
         self.handler.end_headers()
         self.handler.close_connection = True
+        self._write_chunk({"role": "assistant", "content": ""})
         for packet in packets:
             self._write_chunk(packet["delta"])
 
@@ -1126,7 +1128,7 @@ class Context:
 
     def _write_chunk(self, delta, finish_reason=None, usage=None):
         chunk = _chunk([{"index": 0, "delta": delta, "finish_reason": finish_reason}],
-                       model=self.model)
+                       model=self.model, completion_id=self.completion_id)
         if usage:
             chunk["usage"] = usage
         self.handler.wfile.write(b"data: " + json.dumps(chunk).encode() + b"\n\n")
@@ -1150,7 +1152,7 @@ class Context:
                 for c in translator.calls
             ]
         payload = {
-            "id": "chatcmpl-gateway", "object": "chat.completion",
+            "id": self.completion_id, "object": "chat.completion",
             "created": int(time.time()), "model": self.model,
             "choices": [{"index": 0, "message": message, "finish_reason": finish_reason}],
         }

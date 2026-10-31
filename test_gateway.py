@@ -332,7 +332,8 @@ def test_stream_chunks_have_openai_shape_and_usage(store):
         lines = [line[6:] for line in raw.splitlines() if line.startswith("data: ")]
         assert lines[-1] == "[DONE]"
         chunks = [json.loads(line) for line in lines[:-1]]
-        first = chunks[0]
+        assert chunks[0]["choices"][0]["delta"] == {"role": "assistant", "content": ""}
+        first = chunks[1]
         assert first["choices"][0]["index"] == 0
         assert first["choices"][0]["delta"] == {"content": "ok"}
         final = chunks[-1]
@@ -557,8 +558,9 @@ def test_stream_reasoning_starts_stream_immediately(store):
         lines = [line[6:] for line in raw.splitlines() if line.startswith("data: ")]
         assert lines[-1] == "[DONE]"
         chunks = [json.loads(line) for line in lines[:-1]]
-        assert chunks[0]["choices"][0]["delta"] == {"reasoning_content": "pondering"}
-        assert chunks[1]["choices"][0]["delta"] == {"content": "result"}
+        assert chunks[0]["choices"][0]["delta"] == {"role": "assistant", "content": ""}
+        assert chunks[1]["choices"][0]["delta"] == {"reasoning_content": "pondering"}
+        assert chunks[2]["choices"][0]["delta"] == {"content": "result"}
     finally:
         gateway.close()
         upstream.close()
@@ -604,17 +606,20 @@ def test_streaming_reasoning_followed_by_tool_call_emits_opening_packet(store):
         assert lines[-1] == "[DONE]"
         chunks = [json.loads(line) for line in lines[:-1]]
 
-        # Chunk 0 has reasoning
-        assert chunks[0]["choices"][0]["delta"] == {"reasoning_content": "I need to call get_weather."}
+        # Chunk 0 has role assistant
+        assert chunks[0]["choices"][0]["delta"] == {"role": "assistant", "content": ""}
 
-        # Chunk 1 MUST have tool call definition (index, id, type, name)
-        tool_call_chunk = chunks[1]["choices"][0]["delta"]["tool_calls"][0]
+        # Chunk 1 has reasoning
+        assert chunks[1]["choices"][0]["delta"] == {"reasoning_content": "I need to call get_weather."}
+
+        # Chunk 2 MUST have tool call definition (index, id, type, name)
+        tool_call_chunk = chunks[2]["choices"][0]["delta"]["tool_calls"][0]
         assert tool_call_chunk["index"] == 0
         assert tool_call_chunk["id"] == "call1"
         assert tool_call_chunk["function"]["name"] == "get_weather"
 
-        # Chunk 2 has arguments
-        args_chunk = chunks[2]["choices"][0]["delta"]["tool_calls"][0]
+        # Chunk 3 has arguments
+        args_chunk = chunks[3]["choices"][0]["delta"]["tool_calls"][0]
         assert args_chunk["index"] == 0
         assert args_chunk["function"]["arguments"] == "{\"loc\": \"PA\"}"
 
@@ -1083,6 +1088,54 @@ def test_upstream_error_body_sentinel_never_logged(store, caplog):
             status, raw = gateway.post(chat())
             assert status == 502
             assert sentinel not in caplog.text
+    finally:
+        gateway.close()
+        upstream.close()
+
+
+def test_sequential_requests_have_different_completion_ids_and_stream_shares_id(store):
+    upstream = FakeUpstream(lambda count, payload: (200, "".join(text_events("hello"))))
+    gateway = RunningGateway(store, upstream.url)
+    try:
+        # Non-streaming sequential IDs
+        s1, raw1 = gateway.post(chat(stream=False))
+        s2, raw2 = gateway.post(chat(stream=False))
+        assert s1 == 200 and s2 == 200
+        id1 = json.loads(raw1)["id"]
+        id2 = json.loads(raw2)["id"]
+        assert id1.startswith("chatcmpl-")
+        assert id2.startswith("chatcmpl-")
+        assert id1 != id2
+
+        # Streaming shares ID across all chunks
+        s_stream, raw_stream = gateway.post(chat(stream=True))
+        assert s_stream == 200
+        lines = [line[6:] for line in raw_stream.splitlines() if line.startswith("data: ")]
+        chunks = [json.loads(line) for line in lines if line != "[DONE]"]
+        assert len(chunks) >= 2
+        stream_id = chunks[0]["id"]
+        assert stream_id.startswith("chatcmpl-")
+        assert stream_id not in (id1, id2)
+        assert all(c["id"] == stream_id for c in chunks)
+    finally:
+        gateway.close()
+        upstream.close()
+
+
+def test_stream_opens_with_single_role_chunk(store):
+    upstream = FakeUpstream(lambda count, payload: (200, "".join(text_events("content"))))
+    gateway = RunningGateway(store, upstream.url)
+    try:
+        status, raw = gateway.post(chat(stream=True))
+        assert status == 200
+        lines = [line[6:] for line in raw.splitlines() if line.startswith("data: ")]
+        chunks = [json.loads(line) for line in lines if line != "[DONE]"]
+        first_delta = chunks[0]["choices"][0]["delta"]
+        assert first_delta == {"role": "assistant", "content": ""}
+
+        # Count occurrences of role == 'assistant'
+        role_occurrences = [c for c in chunks if c["choices"][0]["delta"].get("role") == "assistant"]
+        assert len(role_occurrences) == 1
     finally:
         gateway.close()
         upstream.close()
