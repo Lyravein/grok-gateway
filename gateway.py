@@ -408,6 +408,36 @@ EFFORT_MAP = {
     "ultra": "xhigh",
 }
 
+EFFORT_VARIANTS = {
+    "grok-4.7": {"low", "medium", "xhigh"},
+    "grok-4.6": set(),
+    "grok-4.5": set(),
+}
+
+
+def resolve_effort_model(model, effort, mode="variant"):
+    if not effort:
+        return model, None
+    mode_norm = (mode or "variant").strip().lower()
+    if mode_norm != "field":
+        mode_norm = "variant"
+
+    effort_norm = EFFORT_MAP.get(effort.lower(), effort.lower())
+    if effort_norm not in VALID_EFFORTS:
+        effort_norm = "minimal"
+
+    if mode_norm == "field":
+        return model, {"effort": effort_norm}
+
+    if effort_norm == "high":
+        return model, None
+
+    target_variant = "low" if effort_norm == "minimal" else effort_norm
+    variants = EFFORT_VARIANTS.get(model, set())
+    if target_variant in variants:
+        return f"{model}-{target_variant}", None
+    return model, {"effort": effort_norm}
+
 
 def translate_request(body, reasoning_cache=None):
     raw_model = str(body.get("model") or "grok-4.7").strip()
@@ -425,13 +455,25 @@ def translate_request(body, reasoning_cache=None):
                 break
     if model in ("", "grok"):
         model = "grok-4.7"
+
+    mode = os.environ.get("GATEWAY_EFFORT_MODE", "").strip().lower()
+    if mode != "field":
+        mode = "variant"
+
+    upstream_model, reasoning_field = resolve_effort_model(model, effort, mode=mode)
+    if effort:
+        effort_norm = EFFORT_MAP.get(effort.lower(), effort.lower())
+        if effort_norm not in VALID_EFFORTS:
+            effort_norm = "minimal"
+        log.debug("effort %s mode %s upstream_model %s", effort_norm, mode, upstream_model)
+
     instructions, items = translate_messages(body.get("messages"), reasoning_cache=reasoning_cache)
     extra_instructions = os.environ.get("GATEWAY_EXTRA_INSTRUCTIONS", "").strip()
     if extra_instructions:
         instructions = (instructions + "\n\n" + extra_instructions).strip() if instructions else extra_instructions
 
     result = {
-        "model": model,
+        "model": upstream_model,
         "input": items,
         "stream": True,
         "store": bool(body.get("store", False)),
@@ -443,9 +485,8 @@ def translate_request(body, reasoning_cache=None):
         result["max_output_tokens"] = body["max_tokens"]
     elif "max_completion_tokens" in body:
         result["max_output_tokens"] = body["max_completion_tokens"]
-    if effort:
-        effort_norm = EFFORT_MAP.get(effort, effort)
-        result["reasoning"] = {"effort": effort_norm if effort_norm in VALID_EFFORTS else "minimal"}
+    if reasoning_field is not None:
+        result["reasoning"] = reasoning_field
 
     rf = body.get("response_format")
     if isinstance(rf, dict):
