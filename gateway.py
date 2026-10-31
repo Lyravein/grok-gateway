@@ -356,6 +356,36 @@ def text_of(content):
     return ""
 
 
+def translate_user_content(content):
+    if isinstance(content, str):
+        return [{"type": "input_text", "text": content}]
+    if isinstance(content, list):
+        items = []
+        for part in content:
+            if isinstance(part, str):
+                items.append({"type": "input_text", "text": part})
+            elif isinstance(part, dict):
+                ptype = part.get("type")
+                if ptype in (None, "text", "input_text"):
+                    text = part.get("text", "")
+                    if isinstance(text, str):
+                        items.append({"type": "input_text", "text": text})
+                elif ptype in ("image_url", "input_image"):
+                    img = part.get("image_url")
+                    url = img.get("url") if isinstance(img, dict) else (img if isinstance(img, str) else None)
+                    if url:
+                        items.append({"type": "input_image", "image_url": url})
+                elif ptype in ("file", "input_file"):
+                    file_item = {"type": "input_file"}
+                    for k in ("file_id", "file_data", "file_url"):
+                        if k in part:
+                            file_item[k] = part[k]
+                    if len(file_item) > 1:
+                        items.append(file_item)
+        return items or [{"type": "input_text", "text": ""}]
+    return [{"type": "input_text", "text": text_of(content)}]
+
+
 def translate_messages(messages, reasoning_cache=None):
     instructions, items = [], []
     for message in messages or []:
@@ -365,7 +395,7 @@ def translate_messages(messages, reasoning_cache=None):
             if text:
                 instructions.append(text)
         elif role == "user":
-            items.append({"role": "user", "content": [{"type": "input_text", "text": text}]})
+            items.append({"role": "user", "content": translate_user_content(message.get("content"))})
         elif role == "assistant":
             cached_reasoning = None
             for call in message.get("tool_calls") or []:
@@ -420,6 +450,7 @@ def translate_request(body, reasoning_cache=None):
         "model": model,
         "input": items,
         "stream": True,
+        "store": bool(body.get("store", False)),
         "include": ["reasoning.encrypted_content"],
     }
     if instructions:
@@ -430,6 +461,23 @@ def translate_request(body, reasoning_cache=None):
         result["max_output_tokens"] = body["max_completion_tokens"]
     if effort:
         result["reasoning"] = {"effort": effort}
+
+    rf = body.get("response_format")
+    if isinstance(rf, dict):
+        rf_type = rf.get("type")
+        if rf_type == "json_object":
+            result["text"] = {"format": {"type": "json_object"}}
+        elif rf_type == "json_schema":
+            schema = None
+            if isinstance(rf.get("json_schema"), dict):
+                schema = rf["json_schema"].get("schema")
+            elif "schema" in rf:
+                schema = rf["schema"]
+            if schema is not None:
+                result["text"] = {"format": {"type": "json_schema", "schema": schema}}
+        elif rf_type in ("text", "plain_text"):
+            result["text"] = {"format": {"type": "text"}}
+
     tools = [
         {"type": "function", **t["function"]} for t in body.get("tools") or []
         if isinstance(t, dict) and t.get("type") == "function" and isinstance(t.get("function"), dict)
@@ -440,10 +488,27 @@ def translate_request(body, reasoning_cache=None):
                 tools.append({"type": "function", **f})
     if tools:
         result["tools"] = tools
-    if "tool_choice" in body:
-        result["tool_choice"] = body["tool_choice"]
+        if "tool_choice" in body:
+            tc = body["tool_choice"]
+            if isinstance(tc, str) and tc in ("auto", "required", "none"):
+                result["tool_choice"] = tc
+            elif isinstance(tc, dict):
+                if tc.get("type") == "function":
+                    fn = tc.get("function")
+                    name = fn.get("name") if isinstance(fn, dict) else tc.get("name")
+                    if name:
+                        result["tool_choice"] = {"type": "function", "name": name}
     if "parallel_tool_calls" in body:
         result["parallel_tool_calls"] = bool(body["parallel_tool_calls"])
+
+    for param in ("temperature", "top_p", "presence_penalty", "frequency_penalty", "seed"):
+        if param in body and isinstance(body[param], (int, float)):
+            result[param] = body[param]
+    if "stop" in body and isinstance(body["stop"], (str, list)):
+        result["stop"] = body["stop"]
+    if "user" in body and isinstance(body["user"], str):
+        result["user"] = body["user"]
+
     return result
 
 

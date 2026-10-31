@@ -973,6 +973,91 @@ def test_end_to_end_reasoning_stitching_multi_turn(store):
         upstream.close()
 
 
+def test_translate_request_response_format_json_and_schema():
+    body_json = {
+        "model": "grok-4.7",
+        "messages": [{"role": "user", "content": "give json"}],
+        "response_format": {"type": "json_object"},
+    }
+    r1 = translate_request(body_json)
+    assert r1["text"] == {"format": {"type": "json_object"}}
+
+    body_schema = {
+        "model": "grok-4.7",
+        "messages": [{"role": "user", "content": "give structured"}],
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {"name": "user", "schema": {"type": "object"}},
+        },
+    }
+    r2 = translate_request(body_schema)
+    assert r2["text"] == {"format": {"type": "json_schema", "schema": {"type": "object"}}}
+
+
+def test_translate_request_tool_choice_normalization():
+    # When tools are provided, nested function choice is flattened
+    body = {
+        "model": "grok-4.7",
+        "messages": [{"role": "user", "content": "calc"}],
+        "tools": [{"type": "function", "function": {"name": "calculator"}}],
+        "tool_choice": {"type": "function", "function": {"name": "calculator"}},
+    }
+    r1 = translate_request(body)
+    assert r1["tool_choice"] == {"type": "function", "name": "calculator"}
+
+    # When no tools are provided, tool_choice is dropped to avoid xAI HTTP 400
+    body_no_tools = {
+        "model": "grok-4.7",
+        "messages": [{"role": "user", "content": "hi"}],
+        "tool_choice": "auto",
+    }
+    r2 = translate_request(body_no_tools)
+    assert "tool_choice" not in r2
+
+
+def test_translate_messages_multimodal_vision():
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "what is this?"},
+                {"type": "image_url", "image_url": {"url": "https://example.com/cat.png"}},
+            ],
+        }
+    ]
+    _, items = translate_messages(messages)
+    assert len(items) == 1
+    content = items[0]["content"]
+    assert len(content) == 2
+    assert content[0] == {"type": "input_text", "text": "what is this?"}
+    assert content[1] == {"type": "input_image", "image_url": "https://example.com/cat.png"}
+
+
+def test_translate_request_sampling_and_metadata():
+    body = {
+        "model": "grok-4.7",
+        "messages": [{"role": "user", "content": "hi"}],
+        "temperature": 0.7,
+        "top_p": 0.9,
+        "presence_penalty": 0.2,
+        "frequency_penalty": 0.3,
+        "seed": 42,
+        "stop": ["STOP"],
+        "user": "client-uid",
+        "metadata": {"some": "framework-leak"},  # should be omitted
+    }
+    res = translate_request(body)
+    assert res["temperature"] == 0.7
+    assert res["top_p"] == 0.9
+    assert res["presence_penalty"] == 0.2
+    assert res["frequency_penalty"] == 0.3
+    assert res["seed"] == 42
+    assert res["stop"] == ["STOP"]
+    assert res["user"] == "client-uid"
+    assert "metadata" not in res
+    assert res["store"] is False
+
+
 
 
 
